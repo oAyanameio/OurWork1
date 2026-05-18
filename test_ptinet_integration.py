@@ -82,5 +82,84 @@ def main():
         return 1
 
 
+def test_t2fpv_batch_first_and_cofe_gradients():
+    """验证 T2FPV batch-first 输入可用，并且端到端损失会更新 CoFE 参数。"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    class Args:
+        def __init__(self):
+            self.dataset = "T2FPV"
+            self.input = 5
+            self.hidden_size = 32
+            self.device = device
+            self.use_attribute = False
+            self.use_image = False
+            self.image_network = "clstm"
+            self.use_opticalflow = False
+            self.hardtanh_limit = 100
+            self.use_cofe = True
+            self.cofe_hidden_size = 16
+            self.cofe_num_layers = 1
+            self.cofe_use_resnet = False
+            self.cofe_loss_weight = 0.1
+            self.output = 3
+            self.skip = 1
+
+    model = PTINet(Args()).to(device)
+    model.train()
+
+    batch, timesteps = 4, 5
+    # 模拟 DataLoader 输出的 T2FPV batch-first 格式：(B, T, [x, y, yaw])。
+    hist_all = torch.randn(batch, timesteps, 3, device=device)
+    # 模拟可用于 CoFE 监督的干净历史轨迹，用于验证联合训练时 CoFE 有梯度。
+    hist_abs_gt = hist_all[..., :2] + 0.01 * torch.randn(batch, timesteps, 2, device=device)
+    target_speed = torch.randn(batch, 3, 2, device=device)
+    target_cross = torch.softmax(torch.randn(batch, 3, 2, device=device), dim=-1)
+
+    mloss, speed_preds, crossing_preds = model(hist_all=hist_all, hist_abs_gt=hist_abs_gt)
+    loss = mloss + torch.nn.functional.mse_loss(speed_preds, target_speed)
+    loss = loss + torch.nn.functional.binary_cross_entropy(crossing_preds, target_cross)
+    loss.backward()
+
+    grad_norm = sum(
+        p.grad.detach().abs().sum().item()
+        for p in model.cofe.parameters()
+        if p.grad is not None
+    )
+    assert grad_norm > 0
+
+
+def test_t2fpv_resnet_cofe_without_features_uses_zero_fallback():
+    """启用 CoFE ResNet 分支但缺少特征时，应使用零特征兜底而不是维度崩溃。"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    class Args:
+        def __init__(self):
+            self.dataset = "T2FPV"
+            self.input = 5
+            self.hidden_size = 32
+            self.device = device
+            self.use_attribute = False
+            self.use_image = False
+            self.image_network = "clstm"
+            self.use_opticalflow = False
+            self.hardtanh_limit = 100
+            self.use_cofe = True
+            self.cofe_hidden_size = 16
+            self.cofe_num_layers = 1
+            self.cofe_use_resnet = True
+            self.output = 3
+            self.skip = 1
+
+    model = PTINet(Args()).to(device)
+    # 故意不传 hist_resnet：测试 CoFE ResNet 分支的零特征兜底逻辑。
+    hist_all = torch.randn(2, 5, 3, device=device)
+
+    with torch.no_grad():
+        outputs = model(hist_all=hist_all)
+    assert outputs[1].shape == (2, 3, 2)
+    assert outputs[2].shape == (2, 3, 2)
+
+
 if __name__ == "__main__":
     sys.exit(main())

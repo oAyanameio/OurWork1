@@ -163,6 +163,22 @@ class CoFE(nn.Module):
 
         return offset_pred[..., self.offset_idxs]
 
+    def _encode_resnet_step(self, hist_resnet, t, num_agents, device):
+        """编码单帧 ResNet 特征，并处理特征缺失的机器人部署场景。
+
+        cofe_use_resnet=True 时 corr_enc 的输入维度会包含视觉分支。若某个实验
+        暂时没有预提取 ResNet 特征，直接拼空张量会造成维度不匹配；这里用
+        2048 维零特征兜底，保证模型结构和参数维度保持一致。
+        """
+        if self.f_resnet is None:
+            return torch.empty((num_agents, 0), device=device)
+        if hist_resnet is None:
+            hist_resnet_t = torch.zeros(num_agents, 2048, device=device)
+        else:
+            # 正常路径：使用 T2FPV/机器人数据集中随时间对齐的视觉特征。
+            hist_resnet_t = hist_resnet[t]
+        return self.f_resnet(hist_resnet_t)
+
     def train_correction(self, hist_abs_gt, hist_yaw_gt, hist_abs_pred,
                          hist_yaw_pred, hist_resnet, hist_seq_start_end):
         timesteps, num_agents, _ = hist_abs_gt.shape
@@ -171,15 +187,14 @@ class CoFE(nn.Module):
         MSE = torch.zeros(1).to(device)
         h = torch.zeros(self.num_layers, num_agents, self.hidden_size, device=device)
 
+        # 训练 CoFE 时，GT 和噪声预测轨迹必须进入相同特征空间，
+        # 这样修正损失监督的是位移/yaw/ego-relative 等被 idxs 选中的特征。
         offset_gt = self.build_features(hist_abs_gt, hist_yaw_gt, hist_seq_start_end)
         offset_pred = self.build_features(hist_abs_pred, hist_yaw_pred, hist_seq_start_end)
 
         for t in range(timesteps):
             f_offset_t = self.f_offset(offset_pred[t])
-            if self.f_resnet is not None:
-                f_resnet_t = self.f_resnet(hist_resnet[t])
-            else:
-                f_resnet_t = torch.empty((offset_pred[t].shape[0], 0), device=device)
+            f_resnet_t = self._encode_resnet_step(hist_resnet, t, num_agents, device)
             x_enc = torch.cat([f_offset_t, f_resnet_t, h[-1]], dim=-1)
             x_corr = self.corr_enc(x_enc)
             _, h = self.corr_rnn(x_corr.unsqueeze(0), h)
@@ -201,20 +216,19 @@ class CoFE(nn.Module):
         rel_pred[1:] = hist_abs_pred[1:] - hist_abs_pred[:-1]
 
         if hist_yaw_pred is not None and hist_seq_start_end is not None:
+            # FPV/T2FPV 路径：使用 ego 相对坐标、yaw 编码和相对位移构造 CoFE 特征。
             offset_pred = self.build_features(
                 hist_abs_pred, hist_yaw_pred, hist_seq_start_end
             )
         else:
+            # BEV/旧 PTINet 路径：没有 yaw/场景边界时退化为纯相对位移修正。
             offset_pred = rel_pred
 
         h = torch.zeros(self.num_layers, num_agents, self.hidden_size, device=device)
 
         for t in range(timesteps):
             f_offset_t = self.f_offset(offset_pred[t])
-            if self.f_resnet is not None and hist_resnet is not None:
-                f_resnet_t = self.f_resnet(hist_resnet[t])
-            else:
-                f_resnet_t = torch.empty((offset_pred[t].shape[0], 0), device=device)
+            f_resnet_t = self._encode_resnet_step(hist_resnet, t, num_agents, device)
             x_enc = torch.cat([f_offset_t, f_resnet_t, h[-1]], dim=-1)
             x_corr = self.corr_enc(x_enc)
             _, h = self.corr_rnn(x_corr.unsqueeze(0), h)
