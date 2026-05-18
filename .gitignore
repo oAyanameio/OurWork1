@@ -8,3 +8,4 @@ output/
 runs/
 data/
 *.pdf
+ptinet_env/

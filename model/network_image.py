@@ -23,6 +23,7 @@ from torchvision.models import ResNet50_Weights, ResNet18_Weights
 # Import custom modules
 from model.clstm import ConvLSTM
 from model.vae import LSTMVAE
+from model.cofe import CoFE
 
 
 class PTINet(nn.Module):
@@ -172,6 +173,14 @@ class PTINet(nn.Module):
                 batch_first=True
             )
 
+        # ========== CoFE轨迹去噪修复模块 ==========
+        if args.use_cofe:
+            self.cofe = CoFE(
+                input_size=self.size,
+                hidden_size=args.cofe_hidden_size,
+                num_layers=args.cofe_num_layers
+            )
+
         # ========== 解码器模块 ==========
         # 位置嵌入层 - 将隐藏状态映射回位置空间
         self.pos_embedding = nn.Sequential(
@@ -240,6 +249,33 @@ class PTINet(nn.Module):
                 [2] - 穿越意图预测, shape=(batch_size, output_len, 2)
                 [3] - (可选)平均意图标签, shape=(batch_size,)
         """
+
+        # ========== 0. CoFE轨迹修复（可选） ==========
+        # 流程: batch_first -> seq_first -> CoFE去噪 -> batch_first -> LSTM-VAE
+        if self.args.use_cofe and pos is not None:
+            # 步骤1: 维度转换 [batch_size, seq_len, dim] -> [seq_len, batch_size, dim]
+            #         CoFE内部使用for t in range(seq_len)按时间步循环，要求时间步在第0维
+            pos_seq_first = pos.permute(1, 0, 2)
+            # 步骤2: 送入CoFE进行去噪修复
+            #         PTINet为BEV视角，没有yaw/ResNet/seq_start_end数据，传None
+            corrected_pos_seq_first = self.cofe.infer_correction(
+                pos_seq_first,
+                hist_yaw_pred=None,
+                hist_resnet=None,
+                hist_seq_start_end=None,
+            )
+            # 步骤3: 维度复原 [seq_len, batch_size, dim] -> [batch_size, seq_len, dim]
+            #         恢复batch_first格式，供后续LSTMVAE(batch_first=True)使用
+            pos = corrected_pos_seq_first.permute(1, 0, 2)
+            # 步骤4: 从修复后的位置序列重新计算速度（帧间差）
+            #         保证位置与速度的物理一致性
+            # 4a: 废弃原speed，创建与pos形状相同的新张量
+            new_speed = torch.zeros_like(pos)
+            # 4b: 一阶差分计算：第t步速度 = pos[t] - pos[t-1]
+            #     第0步保持为0（无前一帧可差分）
+            new_speed[:, 1:, :] = pos[:, 1:, :] - pos[:, :-1, :]
+            # 4c: 覆盖原speed变量
+            speed = new_speed
 
         # ========== 1. 时序特征编码 ==========
         # 速度编码
