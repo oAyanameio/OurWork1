@@ -1,266 +1,237 @@
-import torch
-import time
 import sys
-sys.path.insert(0, '/home/lbh/OurWork1')
+import time
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model.cofe import CoFE
 
 
 def test_ego_dists_consistency():
-    """\u6d4b\u8bd5ego_dists\u51fd\u6570\u7684\u529f\u80fd\u4e00\u81f4\u6027"""
+    """测试 ego_dists 向量化实现与原始循环实现一致。"""
     print("=" * 60)
-    print("\u6d4b\u8bd51: ego_dists\u529f\u80fd\u4e00\u81f4\u6027")
+    print("测试1: ego_dists 功能一致性")
     print("=" * 60)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    T, N, S = 10, 20, 3
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    T, N = 10, 20
     hist_abs = torch.randn(T, N, 2, device=device) * 10
     seq_start_end = torch.tensor([[0, 7], [7, 15], [15, 20]], device=device)
-    
+
     def ego_dists_original(hist_abs, seq_start_end):
         hist_ego_abs = torch.zeros_like(hist_abs)
-        for (start, end) in seq_start_end:
-            hist_ego_abs[:, start:end] = (
-                hist_abs[:, start:end] - hist_abs[:, start].unsqueeze(1)
-            )
+        for start, end in seq_start_end:
+            hist_ego_abs[:, start:end] = hist_abs[:, start:end] - hist_abs[:, start].unsqueeze(1)
         return hist_ego_abs
-    
+
     result_new = CoFE.ego_dists(hist_abs, seq_start_end)
     result_original = ego_dists_original(hist_abs, seq_start_end)
-    
+
     max_diff = torch.max(torch.abs(result_new - result_original)).item()
-    print(f"\u6700\u5927\u8bef\u5dee: {max_diff:.10f}")
-    print(f"\u7ed3\u679c\u4e00\u81f4: {torch.allclose(result_new, result_original, atol=1e-8)}")
-    
-    if not torch.allclose(result_new, result_original, atol=1e-8):
-        print("ERROR: \u7ed3\u679c\u4e0d\u4e00\u81f4!")
-        return False
-    
-    print("\u2705 ego_dists\u529f\u80fd\u9a8c\u8bc1\u901a\u8fc7!")
-    return True
+    print(f"最大误差: {max_diff:.10f}")
+    assert torch.allclose(result_new, result_original, atol=1e-8)
+
+    print("✅ ego_dists 功能验证通过!")
 
 
 def test_encode_yaw_consistency():
-    """\u6d4b\u8bd5encode_yaw\u51fd\u6570\u7684\u529f\u80fd\u4e00\u81f4\u6027"""
+    """测试 encode_yaw 向量化实现与原始循环实现一致。"""
     print("\n" + "=" * 60)
-    print("\u6d4b\u8bd52: encode_yaw\u529f\u80fd\u4e00\u81f4\u6027")
-    print("=" * 0)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    T, N, S = 10, 20, 3
+    print("测试2: encode_yaw 功能一致性")
+    print("=" * 60)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    T, N = 10, 20
     hist_yaw = torch.randn(T, N, device=device) * 360
     seq_start_end = torch.tensor([[0, 7], [7, 15], [15, 20]], device=device)
-    
+
     def encode_yaw_original(hist_yaw, seq_start_end):
         offset_yaw_rel = torch.zeros_like(hist_yaw)
-        for (start, end) in seq_start_end:
-            offset_yaw_rel[:, start:end] = (
-                hist_yaw[:, start:end] - hist_yaw[:, start].unsqueeze(1)
-            )
+        for start, end in seq_start_end:
+            offset_yaw_rel[:, start:end] = hist_yaw[:, start:end] - hist_yaw[:, start].unsqueeze(1)
         offset_yaw_norm = ((180 + offset_yaw_rel) % 360 - 180)
         offset_yaw_rad = torch.deg2rad(offset_yaw_norm)
         return torch.stack([torch.cos(offset_yaw_rad), torch.sin(offset_yaw_rad)], dim=-1)
-    
+
     result_new = CoFE.encode_yaw(hist_yaw, seq_start_end)
     result_original = encode_yaw_original(hist_yaw, seq_start_end)
-    
+
     max_diff = torch.max(torch.abs(result_new - result_original)).item()
-    print(f"\u6700\u5927\u8bef\u5dee: {max_diff:.10f}")
-    print(f"\u7ed3\u679c\u4e00\u81f4: {torch.allclose(result_new, result_original, atol=1e-8)}")
-    
-    if not torch.allclose(result_new, result_original, atol=1e-8):
-        print("ERROR: \u7ed3\u679c\u4e0d\u4e00\u81f4!")
-        return False
-    
-    print("\u2705 encode_yaw\u529f\u80fd\u9a8c\u8bc1\u901a\u8fc7!")
-    return True
+    print(f"最大误差: {max_diff:.10f}")
+    assert torch.allclose(result_new, result_original, atol=1e-8)
+
+    print("✅ encode_yaw 功能验证通过!")
 
 
 def test_boundary_conditions():
-    """\"\u6d4b\u8bd5\u8fb9\u754c\u6761\u4ef6"""
+    """测试单场景与单 agent 场景等边界条件。"""
     print("\n" + "=" * 60)
-    print("\u6d4b\u8bd53: \u8fb9\u754c\u6761\u4ef6\u6d4b\u8bd5")
+    print("测试3: 边界条件测试")
     print("=" * 60)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    print("\n\u8fb9\u754c\u6d4b\u8bd51: \u5355\u4e2a\u573a\u666f")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("\n边界测试1: 单个场景")
     T, N = 5, 10
     hist_abs = torch.randn(T, N, 2, device=device)
     hist_yaw = torch.randn(T, N, device=device) * 360
     seq_start_end = torch.tensor([[0, 10]], device=device)
-    
+
     result_ego = CoFE.ego_dists(hist_abs, seq_start_end)
     result_yaw = CoFE.encode_yaw(hist_yaw, seq_start_end)
-    print(f"\u5355\u4e2ascene\u573aego_dists\u5f62\u72b6: {result_ego.shape}")
-    print(f"\u5355\u4e2a\u6bd5\u573aencode_yaw\u5f62\u72b6: {result_yaw.shape}")
-    
-    print("\n\u8fb9\u754c\u6d4b\u8bd52: \u6bcf\u4e2a\u573a\u666f\u53ea\u6709\u4e00agent")
-    T, N, S = 5, 5, 5
+    assert result_ego.shape == (T, N, 2)
+    assert result_yaw.shape == (T, N, 2)
+
+    print("\n边界测试2: 每个场景只有一个 agent")
+    T, N = 5, 5
     hist_abs = torch.randn(T, N, 2, device=device)
     hist_yaw = torch.randn(T, N, device=device) * 360
-    seq_start_end = torch.tensor([[i, i+1] for i in range(5)], device=device)
-    
+    seq_start_end = torch.tensor([[i, i + 1] for i in range(N)], device=device)
+
     result_ego = CoFE.ego_dists(hist_abs, seq_start_end)
-    result_yawltshape
-    print(f"\u573a\u666f\u5f62\u72b6: {seq_start_end.shape}")
-    print(f"ego_dists\u7ed3\u679c: {result_ego.shape}")
-    print(f"encode_yaw\u7ed3\u679c: {result_yaw.shape}")
-    
+    result_yaw = CoFE.encode_yaw(hist_yaw, seq_start_end)
+    assert result_ego.shape == (T, N, 2)
+    assert result_yaw.shape == (T, N, 2)
+
     max_ego_diff = torch.max(torch.abs(result_ego)).item()
-    print(f"\u6bcf\u4e2aagent\u7684ego\u76f8\u5bf9\u5750\u6807\u6700\u5927\u503c: {max_ego_diff:.10f}")
-    assert max_ego_diff < 1e-8, "\u5355\u4e2aagent\u573a\u666f\u7684\u76f8\u5bf9\u5750\u6807\u5e94\u8be5\u4e3a0"
-    
-    print("\u2705 \u8fb9\u754c\u6761\u4ef6\u6d4b\u8bd5\u901a\u8fc7!")
-    return True
+    max_yaw_sin = torch.max(torch.abs(result_yaw[..., 1])).item()
+    assert max_ego_diff < 1e-8, "单 agent 场景的 ego 相对坐标应该为 0"
+    assert max_yaw_sin < 1e-6, "单 agent 场景的 ego 相对 yaw 应该为 0 度"
+
+    print("✅ 边界条件测试通过!")
 
 
-    test_performance():
-    """\u6027\u80fd\u5bf9\u6bd4\u6d4b\u8bd5"""
+def test_performance():
+    """性能对比测试；只用于输出参考，不作为正确性门禁。"""
     print("\n" + "=" * 60)
-    print("\u6d4b\u8bd54: \u6027\u80fd\u5bf9\u6bd4\u6d4b\u8bd5")
+    print("测试4: 性能对比测试")
     print("=" * 60)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\u4f7f\u7528\u8bbe\u5907: {device}")
-    
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+
     T, N, S = 30, 200, 20
     hist_abs = torch.randn(T, N, 2, device=device) * 10
     hist_yaw = torch.randn(T, N, device=device) * 360
-    seq_start_end = torch.tensor([[i*10, (i+1)*10] for i in range(S)], device=device)
-    
+    seq_start_end = torch.tensor([[i * 10, (i + 1) * 10] for i in range(S)], device=device)
+
     def ego_dists_original(hist_abs, seq_start_end):
         hist_ego_abs = torch.zeros_like(hist_abs)
-        for (start, end) in seq_start_end:
-            hist_ego_abs[:, start:end] = (
-                hist_abs[:, start:end] - hist_abs[:start].unsqueeze(1)
-            )
+        for start, end in seq_start_end:
+            hist_ego_abs[:, start:end] = hist_abs[:, start:end] - hist_abs[:, start].unsqueeze(1)
         return hist_ego_abs
-    
+
     def encode_yaw_original(hist_yaw, seq_start_end):
         offset_yaw_rel = torch.zeros_like(hist_yaw)
-        for (start, end) in seq_start_end:
-            offset_yaw_rel[:, start:end] = (
-                hist_yaw[:, start:end] - hist_yaw[:, start].unsqueeze(1)
-            )
+        for start, end in seq_start_end:
+            offset_yaw_rel[:, start:end] = hist_yaw[:, start:end] - hist_yaw[:, start].unsqueeze(1)
         offset_yaw_norm = ((180 + offset_yaw_rel) % 360 - 180)
         offset_yaw_rad = torch.deg2rad(offset_yaw_norm)
         return torch.stack([torch.cos(offset_yaw_rad), torch.sin(offset_yaw_rad)], dim=-1)
-    
+
     if torch.cuda.is_available():
         CoFE.ego_dists(hist_abs, seq_start_end)
         torch.cuda.synchronize()
-    
-    n_trials = 100
-    
+
+    n_trials = 20
+
     t0 = time.time()
     for _ in range(n_trials):
         ego_dists_original(hist_abs, seq_start_end)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    t1 = time.time()
-    original_time_ego = (t1 - t0) / n_trials
-    
+    original_time_ego = (time.time() - t0) / n_trials
+
     t0 = time.time()
     for _ in range(n_trials):
         CoFE.ego_dists(hist_abs, seq_start_end)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    t1 = time.time()
-    new_time_ego = (t1 - t0) / n_trials
-    
-    print(f"\nego_dists\u6027\u80fd:")
-    print(f"{original_time_ego*1000:.2f} ms/\u6b21")
-    print(f"  \u65b0\u5b9e\u73b0: {new_time_ego*1000:.2f} ms/\u6b21")
-    speedup_ego = original_time_ego / new_time_ego
-    print(f"  \u52a0\u901f\u6bd4: {speedup_ego:.2f}x")
-    
+    new_time_ego = (time.time() - t0) / n_trials
+
+    print("\nego_dists 性能:")
+    print(f"  原实现: {original_time_ego * 1000:.2f} ms/次")
+    print(f"  新实现: {new_time_ego * 1000:.2f} ms/次")
+    print(f"  加速比: {original_time_ego / new_time_ego:.2f}x")
+
     t0 = time.time()
     for _ in range(n_trials):
         encode_yaw_original(hist_yaw, seq_start_end)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    t1 = time.time()
-    original_time_yaw = (t1 - t0) / n_trials
-    
+    original_time_yaw = (time.time() - t0) / n_trials
+
     t0 = time.time()
     for _ in range(n_trials):
         CoFE.encode_yaw(hist_yaw, seq_start_end)
-    if torch._available():
+    if torch.cuda.is_available():
         torch.cuda.synchronize()
-    t1 = time.time()
-    new_time_yaw = (t1 - t0) / n_trials
-    
-    print(f"\nencode_yaw\u6027\u80fd:")
-    print(f"  \u539f\u5b9e\u73b0: {original_time_yaw*1000:.2f} ms/\u6b21")
-    print(f" \u65b0\u5b9e\u73b0: {new_time_yaw*1000:.2f} ms/\u6b21")
-    speedup_yaw = original_time_yaw / new_time_yaw
-    print(f"  \u52a0\u901f\u6bd4: {speedup_yaw:.2f}x")
-    
-    return speedup_ego > 1 or speedup_yaw > 1
+    new_time_yaw = (time.time() - t0) / n_trials
+
+    print("\nencode_yaw 性能:")
+    print(f"  原实现: {original_time_yaw * 1000:.2f} ms/次")
+    print(f"  新实现: {new_time_yaw * 1000:.2f} ms/次")
+    print(f"  加速比: {original_time_yaw / new_time_yaw:.2f}x")
 
 
-    test_full_cofe_pipeline():
-    """\u6d4b\u8bd5\u5b8c\u6574\u7684CoFE pipeline\u662f\u5426\u6b63\u5e38\u5de5\u4f5c"""
+
+def test_full_cofe_pipeline():
+    """测试完整的 CoFE pipeline 是否正常工作。"""
     print("\n" + "=" * 60)
-    print("\u6d4b\u8bd55: \u5b8c\u6574CoFE pipeline 6d4b\u8bd5")
+    print("测试5: 完整 CoFE pipeline 测试")
     print("=" * 60)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    T, N, S = 15, 10, 2
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    T, N = 15, 10
     hist_abs = torch.randn(T, N, 2, device=device) * 5
     hist_yaw = torch.randn(T, N, device=device) * 360
     hist_resnet = torch.randn(T, N, 2048, device=device)
     seq_start_end = torch.tensor([[0, 5], [5, 10]], device=device)
-    
-    cofe = CoFE(input_size=2, hidden_size=96, num_layers=2, 
-                use_resnet=False, no_abs=True, idxs=[6, 7])
-    cofe.to(device)
-    
-    loss = cofe.train_correction(
-        hist_abs, hist_yaw, hist_abs, hist_yaw, 
-        hist_resnet, seq_start_end
-    )
-    print(f"\u8bad\u7ec3\u6a21\u5f0floss: {loss.item():.6f}")
-    
-    corrected = cofe.infer_correction(
-        hist_abs, hist_yaw, hist_resnet, seq_start_end
-    )
-    print(f"\u63a8\u7406\u7ed3\u679c\u5f62\u72b6: {corrected.shape}")
-    print(f"\u7ed3\u679c\u5305\u542bNaN: {torch.isnan(corrected).any().item()}")
-    
-    print("\u2705 \u5b8c\u6574CoFE pipeline\u6d4b\u8bd5\u901a\u8fc7!")
-    return True
+
+    cofe = CoFE(input_size=2, hidden_size=96, num_layers=2, use_resnet=False, no_abs=True, idxs=[6, 7]).to(device)
+
+    loss = cofe.train_correction(hist_abs, hist_yaw, hist_abs, hist_yaw, hist_resnet, seq_start_end)
+    print(f"训练模式 loss: {loss.item():.6f}")
+
+    corrected = cofe.infer_correction(hist_abs, hist_yaw, hist_resnet, seq_start_end)
+    print(f"推理结果形状: {corrected.shape}")
+    assert corrected.shape == hist_abs.shape
+    assert not torch.isnan(corrected).any()
+
+    print("✅ 完整 CoFE pipeline 测试通过!")
 
 
 def main():
     print("\n" + "=" * 60)
-    print("CoFE\u6a21\u5757\u5411\u91cf\u5316\u4f18\u5316\u6d4b\u8bd5\u5957\u4ef6e    print("=" * 60)
-    
+    print("CoFE 模块向量化优化测试套件")
+    print("=" * 60)
+
     all_passed = True
-    
+
     try:
-        test1 = test_ego_dists_consistency()
-        test2 = test_encode_yaw_consistency()
-        test3 = test_boundary_conditions()
-        test4 = test_performance()
-        test5 = test_full_cofe_pipeline()
-        
-        all_passed = test1 and test2 and test3 and test5
-        
+        test_ego_dists_consistency()
+        test_encode_yaw_consistency()
+        test_boundary_conditions()
+        test_performance()
+        test_full_cofe_pipeline()
+
     except Exception as e:
-        print(f"\n\u274c \u6d4b\u8bd5process\u4e2d\u53d1\u751f\u5f02\u5e38: {str(e)}")
-        import traceback        traceback.print_exc()
+        print(f"\n❌ 测试过程中发生异常: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
         all_passed = False
-    
+
     print("\n" + "=" * 60)
     if all_passed:
-        print("\ud83c\udf89 \u6240\u6709\u6d4b\u8bd5\u901a\u8fc7! \u4f18\u5316\u6210\u529f!")
+        print("🎉 所有测试通过! 优化成功!")
     else:
-        print("\u274c \u90e8\u5206\u6d4b\u8bd5\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5")
+        print("❌ 部分测试失败，请检查")
     print("=" * 60)
-    
+
     return 0 if all_passed else 1
 
 

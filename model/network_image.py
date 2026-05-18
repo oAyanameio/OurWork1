@@ -241,6 +241,18 @@ class PTINet(nn.Module):
             new_speed[:, 1:, :] = pos[:, 1:, :] - pos[:, :-1, :]
             speed = new_speed
 
+        pbloss = torch.zeros(1, device=self.args.device)
+        psloss = torch.zeros(1, device=self.args.device)
+        hpa = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+        zpa = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+        hsa = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+        zsa = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+        pb = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+        himg = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+        cimg = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+        himg_op = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+        cimg_op = torch.zeros(pos.size(0), self.args.hidden_size, device=self.args.device)
+
         sloss, _, zsp, hsp, _ = self.speed_encoder(speed)
         hsp = hsp[0].squeeze(0)
         zsp = torch.mean(zsp, axis=1)
@@ -275,8 +287,8 @@ class PTINet(nn.Module):
                 img_feats = self.resnet(images)
                 img_feats = img_feats.view(batch_size, seq_len, -1)
                 imgloss, _, zim, him, _ = self.img_encoder(img_feats)
-                him = him[0].squeeze(0)
-                zim = torch.mean(zim, axis=1)
+                himg = him[0].squeeze(0)
+                cimg = torch.mean(zim, axis=1)
 
         if self.args.use_opticalflow:
             batch_size_op, seq_len_op, c_op, h_op, w_op = optical.size()
@@ -297,22 +309,22 @@ class PTINet(nn.Module):
         in_sp = speed[:, -1, :]
         
         hds = hpo + hsp
-zds = zpo + zsp
+        zds = zpo + zsp
 
         if self.args.use_attribute:
             hds = hds + hpa
-zds = zds + zpa 
+            zds = zds + zpa
             if self.args.dataset == 'jaad' or self.args.dataset == 'pie':  
-                hds = hds + hsa + hpa + pb 
-                zds = zds + zpa + zsa + pb
+                hds = hds + hsa + pb
+                zds = zds + zsa + pb
 
         if self.args.use_image:
             hds = hds + himg
-zds = zds + cimg 
+            zds = zds + cimg
 
         if self.args.use_opticalflow:
             hds = hds + himg_op
-zds = zds + cimg_op 
+            zds = zds + cimg_op
 
         for i in range(self.args.output // self.args.skip):
             hds, zds = self.speed_decoder(in_sp, (hds, zds))
@@ -326,22 +338,22 @@ zds = zds + cimg_op
         in_cr = pos[:, -1, :]
         
         hdc = hpo + hsp
-zdc = zpo + zsp
+        zdc = zpo + zsp
 
         if self.args.use_attribute:
-            hdc = hdc + hpa  
-            zdc = zdc + zpa 
+            hdc = hdc + hpa
+            zdc = zdc + zpa
             if self.args.dataset == 'jaad' or self.args.dataset == 'pie':   
-                hdc = hdc + hsa + hpa + pb 
-                zdc = zdc + zpa + zsa + pb
+                hdc = hdc + hsa + pb
+                zdc = zdc + zsa + pb
 
         if self.args.use_image:
             hdc = hdc + himg
-zdc = zdc + cimg 
+            zdc = zdc + cimg
 
         if self.args.use_opticalflow:
             hdc = hdc + himg_op
-zdc = zdc + cimg_op 
+            zdc = zdc + cimg_op
 
         for i in range(self.args.output // self.args.skip):
             hdc, zdc = self.crossing_decoder(in_cr, (hdc, zdc))
@@ -415,7 +427,7 @@ zdc = zdc + cimg_op
         in_sp = speed[:, -1, :]
 
         hds = hpo + hsp + hpa + hsa + pb + him + hop
-        zds = zpo + zpa + zsa + pb + cim + cop
+        zds = zpo + zsp + zpa + zsa + pb + cim + cop
 
         for i in range(self.args.output // self.args.skip):
             hds, zds = self.speed_decoder(in_sp, (hds, zds))
@@ -429,7 +441,7 @@ zdc = zdc + cimg_op
         in_cr = pos[:, -1, :]
 
         hdc = hpo + hsp + hpa + hsa + pb + him + hop
-        zdc = zpo + zpa + zsa + pb + cim + cop
+        zdc = zpo + zsp + zpa + zsa + pb + cim + cop
 
         for i in range(self.args.output // self.args.skip):
             hdc, zdc = self.crossing_decoder(in_cr, (hdc, zdc))
