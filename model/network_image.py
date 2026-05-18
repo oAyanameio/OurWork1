@@ -1,264 +1,380 @@
+"""
+PTINet: Pedestrian Trajectory and Intention Prediction Network
+
+This module implements the PTINet architecture, a multi-task learning framework
+for joint pedestrian trajectory prediction and crossing intention prediction.
+The model integrates multiple features including:
+- Position and speed trajectories (bounding box sequences)
+- Pedestrian attributes and behaviors
+- Scene attributes
+- Visual features (images via ConvLSTM or ResNet)
+- Optical flow features
+
+Reference: 
+    PTINet paper - Joint Pedestrian Trajectory Prediction and Intention Prediction
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 import torchvision.models as models
-import torchvision
-import torchvision.transforms as transforms
-import numpy as np
-from torchvision.models import ResNet50_Weights
-from torchvision.models import ResNet18_Weights
-from model.clstm import*
-from model.vae import*
+from torchvision.models import ResNet50_Weights, ResNet18_Weights
 
-
-
+# Import custom modules
+from model.clstm import ConvLSTM
+from model.vae import LSTMVAE
 
 
 class PTINet(nn.Module):
+    """
+    PTINet主模型类
+    
+    架构概述:
+    1. 多模态编码器模块：对位置、速度、行为、场景、图像、光流分别进行编码
+    2. 特征融合模块：将各模态特征融合为统一的隐藏状态
+    3. 双任务解码器：分别预测速度轨迹和穿越意图
+    
+    Args:
+        args: 配置参数对象，包含以下关键参数：
+            - dataset: 数据集名称 ('jaad', 'pie', 'titan')
+            - hidden_size: 隐藏层维度
+            - device: 计算设备 ('cuda' 或 'cpu')
+            - use_attribute: 是否使用属性特征
+            - use_image: 是否使用图像特征
+            - image_network: 图像网络类型 ('clstm', 'resnet50', 'resnet18')
+            - use_opticalflow: 是否使用光流特征
+            - output: 输出时间步数
+            - skip: 采样间隔
+            - hardtanh_limit: Hardtanh激活函数的限制范围
+    """
+    
     def __init__(self, args):
         super(PTINet, self).__init__()
 
-        if args.dataset=='jaad':
-            self.size = 4
-            self.ped_attribute_size=3
-            self.ped_behavior_size=4
-            self.scene_attribute_size=10
+        # 根据数据集设置特征维度
+        if args.dataset == 'jaad':
+            self.size = 4                    # 位置/速度特征维度 (x, y, w, h)
+            self.ped_attribute_size = 3      # 行人属性维度 (年龄、性别、群体大小)
+            self.ped_behavior_size = 4       # 行为特征维度 (反应、手势、注视、点头)
+            self.scene_attribute_size = 10   # 场景属性维度
 
-        elif args.dataset=='pie':
+        elif args.dataset == 'pie':
             self.size = 4
-            self.ped_attribute_size=2
-            self.ped_behavior_size=3
-            self.scene_attribute_size=4
+            self.ped_attribute_size = 2
+            self.ped_behavior_size = 3
+            self.scene_attribute_size = 4
 
-        elif args.dataset=='titan':
+        elif args.dataset == 'titan':
             self.size = 4
-            self.ped_behavior_size=3
+            self.ped_behavior_size = 3
         else:
-            'wrong dataset'
+            raise ValueError('Wrong dataset name!')
 
-       
-        self.num_layers=1
-        self.latent_size=args.hidden_size
+        # LSTM层数和隐变量维度
+        self.num_layers = 1
+        self.latent_size = args.hidden_size
         
-        self.speed_encoder = LSTMVAE(input_size=self.size, hidden_size=args.hidden_size, latent_size=self.latent_size, device=args.device)
-        self.pos_encoder = LSTMVAE(input_size=self.size, hidden_size=args.hidden_size, latent_size=self.latent_size, device=args.device)
+        # ========== 时序编码器模块 ==========
+        # 速度序列编码器 - 学习速度变化模式
+        self.speed_encoder = LSTMVAE(
+            input_size=self.size, 
+            hidden_size=args.hidden_size, 
+            latent_size=self.latent_size, 
+            device=args.device
+        )
         
-
-
-        if args.use_attribute == True:
-            self.ped_behavior_encoder = LSTMVAE(input_size=self.ped_behavior_size, hidden_size=args.hidden_size, latent_size=self.latent_size, device=args.device)
+        # 位置序列编码器 - 学习位置轨迹模式
+        self.pos_encoder = LSTMVAE(
+            input_size=self.size, 
+            hidden_size=args.hidden_size, 
+            latent_size=self.latent_size, 
+            device=args.device
+        )
+        
+        # ========== 属性编码器模块 ==========
+        if args.use_attribute:
+            # 行为特征编码器 - 学习行为模式
+            self.ped_behavior_encoder = LSTMVAE(
+                input_size=self.ped_behavior_size, 
+                hidden_size=args.hidden_size, 
+                latent_size=self.latent_size, 
+                device=args.device
+            )
+            
+            # 场景属性编码器 (JAAD和PIE数据集)
             if args.dataset == 'jaad' or args.dataset == 'pie':         
-                self.scene_attribute_encoder   =LSTMVAE(input_size=self.scene_attribute_size, hidden_size=args.hidden_size, latent_size=self.latent_size, device=args.device)
-                self.mlp = nn.Sequential( nn.Linear(self.ped_attribute_size, 64),nn.ReLU(),nn.Linear(64, args.hidden_size),nn.ReLU() )
+                self.scene_attribute_encoder = LSTMVAE(
+                    input_size=self.scene_attribute_size, 
+                    hidden_size=args.hidden_size, 
+                    latent_size=self.latent_size, 
+                    device=args.device
+                )
+                
+                # MLP编码器 - 将行人属性(3维)映射到隐藏层维度
+                self.mlp = nn.Sequential(
+                    nn.Linear(self.ped_attribute_size, 64),   # 第一层：3->64
+                    nn.ReLU(),                               # 激活函数
+                    nn.Linear(64, args.hidden_size),         # 第二层：64->hidden_size
+                    nn.ReLU()                                # 激活函数
+                )
 
-        if args.use_image==True:
-            if args.image_network== 'resnet50':
+        # ========== 视觉编码器模块 ==========
+        if args.use_image:
+            if args.image_network == 'resnet50':
+                # 使用ResNet50提取图像特征
                 self.resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
-                self.resnet.fc = nn.Identity()
-                self.img_encoder   = LSTMVAE(input_size=2048, hidden_size=args.hidden_size, latent_size=self.latent_size, device=args.device)
+                self.resnet.fc = nn.Identity()  # 移除分类层
+                self.img_encoder = LSTMVAE(
+                    input_size=2048,  # ResNet50输出维度
+                    hidden_size=args.hidden_size, 
+                    latent_size=self.latent_size, 
+                    device=args.device
+                )
 
-            elif args.image_network== 'resent18':
+            elif args.image_network == 'resnet18':
+                # 使用ResNet18提取图像特征
                 self.resnet = models.resnet18(weights=ResNet18_Weights.DEFAULT)
                 self.resnet.fc = nn.Identity()
-                self.img_encoder   = nn.LSTM(input_size=512, hidden_size=args.hidden_size,num_layers=self.num_layers,batch_first=True)
+                self.img_encoder = nn.LSTM(
+                    input_size=512,  # ResNet18输出维度
+                    hidden_size=args.hidden_size,
+                    num_layers=self.num_layers,
+                    batch_first=True
+                )
+                
             elif args.image_network == 'clstm':
-                self.clstm=ConvLSTM(input_channels=3, hidden_channels=[128, 64, 64, 32, 32], kernel_size=3, conv_stride=1,pool_kernel_size=(2, 2), step=5, effective_step=[4])
+                # 使用ConvLSTM提取时空特征
+                self.clstm = ConvLSTM(
+                    input_channels=3,           # RGB图像
+                    hidden_channels=[128, 64, 64, 32, 32],  # 5层卷积LSTM
+                    kernel_size=3,              # 卷积核大小
+                    conv_stride=1,              # 卷积步长
+                    pool_kernel_size=(2, 2),    # 池化核大小
+                    step=5,                     # 时间步数
+                    effective_step=[4]          # 有效输出步
+                )
+                # 自适应池化和全连接层将特征映射到hidden_size
                 self.pooling_h = nn.AdaptiveAvgPool2d((1, 1))
                 self.pooling_c = nn.AdaptiveAvgPool2d((1, 1))
-                self.linear_c= nn.Linear(in_features=32, out_features=512)
+                self.linear_c = nn.Linear(in_features=32, out_features=512)
                 self.linear_h = nn.Linear(in_features=32, out_features=512)
 
-        if args.use_opticalflow== True:
+        # ========== 光流编码器模块 ==========
+        if args.use_opticalflow:
+            # 修改ResNet以支持4通道输入（光流x,y方向各2通道）
             self.resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
             self.resnet.conv1 = nn.Conv2d(4, 64, kernel_size=7, stride=2, padding=3, bias=False)
             self.resnet.fc = nn.Identity()
-            self.op_encoder   = nn.LSTM(input_size=2048, hidden_size=args.hidden_size,num_layers=self.num_layers,batch_first=True)
+            self.op_encoder = nn.LSTM(
+                input_size=2048, 
+                hidden_size=args.hidden_size,
+                num_layers=self.num_layers,
+                batch_first=True
+            )
 
-      
+        # ========== 解码器模块 ==========
+        # 位置嵌入层 - 将隐藏状态映射回位置空间
+        self.pos_embedding = nn.Sequential(
+            nn.Linear(in_features=args.hidden_size, out_features=self.size),
+            nn.ReLU()
+        )
         
-        self.pos_embedding = nn.Sequential(nn.Linear(in_features=args.hidden_size, out_features=self.size),
-                                           nn.ReLU())
+        # LSTMCell解码器 - 用于序列生成
+        self.speed_decoder = nn.LSTMCell(      # 速度轨迹解码器
+            input_size=self.size, 
+            hidden_size=args.hidden_size
+        )
+        self.crossing_decoder = nn.LSTMCell(   # 穿越意图解码器
+            input_size=self.size, 
+            hidden_size=args.hidden_size
+        )
+        self.attrib_decoder = nn.LSTMCell(     # 属性解码器（备用）
+            input_size=self.size, 
+            hidden_size=args.hidden_size
+        )
         
-        self.speed_decoder    = nn.LSTMCell(input_size=self.size, hidden_size=args.hidden_size)
-        self.crossing_decoder = nn.LSTMCell(input_size=self.size, hidden_size=args.hidden_size)
-        self.attrib_decoder = nn.LSTMCell(input_size=self.size, hidden_size=args.hidden_size)
+        # 全连接输出层
+        self.fc_speed = nn.Linear(             # 速度预测头
+            in_features=args.hidden_size, 
+            out_features=self.size
+        )
+        self.fc_crossing = nn.Sequential(      # 穿越意图分类头
+            nn.Linear(in_features=args.hidden_size, out_features=2),
+            nn.ReLU()
+        )
+        self.fc_attrib = nn.Sequential(        # 属性预测头（备用）
+            nn.Linear(in_features=args.hidden_size, out_features=3),
+            nn.ReLU()
+        )
         
-        self.fc_speed    = nn.Linear(in_features=args.hidden_size, out_features=self.size)
-        self.fc_crossing = nn.Sequential(nn.Linear(in_features=args.hidden_size, out_features=2), nn.ReLU())
-        self.fc_attrib = nn.Sequential(nn.Linear(in_features=args.hidden_size, out_features=3), nn.ReLU())
+        # 激活函数
+        self.hardtanh = nn.Hardtanh(           # 限制速度输出范围
+            min_val=-1 * args.hardtanh_limit, 
+            max_val=args.hardtanh_limit
+        )
+        self.softmax = nn.Softmax(dim=1)       # 意图概率归一化
         
-        self.hardtanh = nn.Hardtanh(min_val=-1*args.hardtanh_limit, max_val=args.hardtanh_limit)
-        self.softmax = nn.Softmax(dim=1)
-        
+        # 保存配置参数
         self.args = args
         
-    def forward(self, speed=None, pos=None,ped_attribute=None,ped_behavior=None,scene_attribute=None,images=None,optical=None, average=False):
-
-        sloss, x_hat, zsp,hsp, (recon_loss, kld_loss) = self.speed_encoder(speed)
-        hsp = hsp[0].squeeze(0)
-        zsp=torch.mean(zsp,axis=1)
-        # csp = csp.squeeze(0)
+    def forward(self, speed=None, pos=None, ped_attribute=None, 
+                ped_behavior=None, scene_attribute=None, images=None, 
+                optical=None, average=False):
+        """
+        前向传播函数
         
-        ploss, x_hat, zpo,hpo, (recon_loss, kld_loss) = self.pos_encoder(pos)
-        hpo = hpo[0].squeeze(0)
-        zpo=torch.mean(zpo,axis=1)
-        # cpo = cpo.squeeze(0)
+        Args:
+            speed: 速度序列, shape=(batch_size, input_len-1, 4)
+            pos: 位置序列, shape=(batch_size, input_len, 4)
+            ped_attribute: 行人属性, shape=(batch_size, 3)
+            ped_behavior: 行为序列, shape=(batch_size, input_len, 4)
+            scene_attribute: 场景属性序列, shape=(batch_size, input_len, 10)
+            images: 图像序列, shape=(batch_size, input_len, 3, H, W)
+            optical: 光流序列, shape=(batch_size, input_len, 4, H, W)
+            average: 是否计算平均意图标签
+            
+        Returns:
+            tuple: 包含以下元素的元组：
+                [0] - 总重构损失
+                [1] - 速度预测输出, shape=(batch_size, output_len, 4)
+                [2] - 穿越意图预测, shape=(batch_size, output_len, 2)
+                [3] - (可选)平均意图标签, shape=(batch_size,)
+        """
 
+        # ========== 1. 时序特征编码 ==========
+        # 速度编码
+        sloss, _, zsp, hsp, _ = self.speed_encoder(speed)
+        hsp = hsp[0].squeeze(0)      # 隐藏状态: (batch_size, hidden_size)
+        zsp = torch.mean(zsp, axis=1) # 隐变量时间平均: (batch_size, latent_size)
+        
+        # 位置编码
+        ploss, _, zpo, hpo, _ = self.pos_encoder(pos)
+        hpo = hpo[0].squeeze(0)      # 隐藏状态: (batch_size, hidden_size)
+        zpo = torch.mean(zpo, axis=1) # 隐变量时间平均: (batch_size, latent_size)
 
-
-        if self.args.use_attribute == True:
-            pbloss, x_hat, zpa,hpa, (recon_loss, kld_loss)  = self.ped_behavior_encoder (ped_behavior)
+        # ========== 2. 属性特征编码 ==========
+        if self.args.use_attribute:
+            # 行为特征编码
+            pbloss, _, zpa, hpa, _ = self.ped_behavior_encoder(ped_behavior)
             hpa = hpa[0].squeeze(0)
-            zpa = torch.mean(zpa,axis=1)
+            zpa = torch.mean(zpa, axis=1)
 
             if self.args.dataset == 'jaad' or self.args.dataset == 'pie':  
-
-                psloss, x_hat, zsa,hsa, (recon_loss, kld_loss)  = self.scene_attribute_encoder(scene_attribute)
+                # 场景属性编码
+                psloss, _, zsa, hsa, _ = self.scene_attribute_encoder(scene_attribute)
                 hsa = hsa[0].squeeze(0)
-                zsa =torch.mean(zsa,axis=1)
+                zsa = torch.mean(zsa, axis=1)
 
-                pb=self.mlp(ped_attribute)
+                # 行人属性MLP编码
+                pb = self.mlp(ped_attribute)
 
-        if self.args.use_image==True:
+        # ========== 3. 视觉特征编码 ==========
+        if self.args.use_image:
             batch_size, seq_len, c, h, w = images.size()
 
-            if self.args.image_network=='clstm':
-                batch_size, seq_len, c, h, w = images.size()
-                _,(himg, cimg)=self.clstm(images)
-                himg=self.pooling_h(himg).view(himg.size(0), -1)
-                himg=self.linear_h(himg)
-
-                cimg=self.pooling_c(cimg).view(cimg.size(0), -1)
-                cimg=self.linear_c(cimg)
+            if self.args.image_network == 'clstm':
+                # ConvLSTM处理时序图像
+                _, (himg, cimg) = self.clstm(images)
+                # 自适应池化 + 全连接映射
+                himg = self.pooling_h(himg).view(himg.size(0), -1)
+                himg = self.linear_h(himg)
+                cimg = self.pooling_c(cimg).view(cimg.size(0), -1)
+                cimg = self.linear_c(cimg)
             else:
+                # ResNet处理
                 images = images.view(batch_size * seq_len, c, h, w)
                 img_feats = self.resnet(images)
                 img_feats = img_feats.view(batch_size, seq_len, -1)
-
-                imgloss, x_hat, zim,him, (recon_loss, kld_loss) = self.img_encoder(img_feats)
+                imgloss, _, zim, him, _ = self.img_encoder(img_feats)
                 him = him[0].squeeze(0)
-                zim = torch.mean(zim,axis=1)
-        if self.args.use_opticalflow==True:
+                zim = torch.mean(zim, axis=1)
+
+        # ========== 4. 光流特征编码 ==========
+        if self.args.use_opticalflow:
             batch_size_op, seq_len_op, c_op, h_op, w_op = optical.size()
             optical = optical.view(batch_size * seq_len_op, c_op, h_op, w_op)
             op_feats = self.resnet(optical)
             op_feats = op_feats.view(batch_size, seq_len_op, -1)
-
             _, (himg_op, cimg_op) = self.op_encoder(op_feats)
-            himg_op = himg_op[-1,:,:].squeeze(0)
-            cimg_op = cimg_op[-1,:,:].squeeze(0)
+            himg_op = himg_op[-1, :, :].squeeze(0)
+            cimg_op = cimg_op[-1, :, :].squeeze(0)
 
-
-        outputs=[]
-
+        # ========== 5. 计算总重构损失 ==========
+        outputs = []
         if self.args.dataset == 'jaad' or self.args.dataset == 'pie':   
-
-            outputs.append(ploss+sloss+pbloss+psloss)
+            outputs.append(ploss + sloss + pbloss + psloss)
         else:
-            outputs.append(ploss+sloss+pbloss)
+            outputs.append(ploss + sloss + pbloss)
 
-
-
-        #  _, (hsp, csp) = self.speed_encoder(speed.permute(1,0,2))
-        # hsp = hsp.squeeze(0)
-        # csp = csp.squeeze(0)
+        # ========== 6. 速度轨迹预测 ==========
+        speed_outputs = torch.tensor([], device=self.args.device)
+        in_sp = speed[:, -1, :]  # 初始输入：最后一帧的速度
         
-        # _, (hpo, cpo) = self.pos_encoder(pos.permute(1,0,2))
-        # hpo = hpo.squeeze(0)
-        # cpo = cpo.squeeze(0)
-        # outputs = []
-
-        #  if self.args.use_attribute == True:
-        #     _, (hpa, cpa) = self.ped_behavior_encoder (ped_behavior)
-        #     hpa = hpa[-1,:,:].squeeze(0)
-        #     cpa = cpa[-1,:,:].squeeze(0)
-
-        #     _, (hsa, csa) = self.scene_attribute_encoder(scene_attribute)
-        #     hsa = hsa[-1,:,:].squeeze(0)
-        #     csa = csa[-1,:,:].squeeze(0)
-
-        #     pb=self.mlp(ped_attribute)
-
-        # if self.args.use_image==True:
-        #     batch_size, seq_len, c, h, w = images.size()
-        #     images = images.view(batch_size * seq_len, c, h, w)
-        #     img_feats = self.resnet(images)
-        #     img_feats = img_feats.view(batch_size, seq_len, -1)
-
-        #     _, (himg, cimg) = self.img_encoder(img_feats)
-        #     himg = himg[-1,:,:].squeeze(0)
-        #     cimg = cimg[-1,:,:].squeeze(0)
-
-        # outputs = []
-        
-        
-        speed_outputs    = torch.tensor([], device=self.args.device)
-        in_sp = speed[:,-1,:]
-        
-        hds = hpo + hsp
+        # 特征融合 - 速度预测分支
+        hds = hpo + hsp  # 位置 + 速度特征
         zds = zpo + zsp
 
-        if self.args.use_attribute == True:
+        if self.args.use_attribute:
             hds = hds + hpa  
-            zds = zds +zpa 
+            zds = zds + zpa 
             if self.args.dataset == 'jaad' or self.args.dataset == 'pie':  
-                hds = hds+ hsa  + hpa  + pb 
-                zds = zds +zpa + zsa + pb
+                hds = hds + hsa + hpa + pb 
+                zds = zds + zpa + zsa + pb
 
-        if self.args.use_image ==True:
-            hds=hds + himg
-            zds=zds + cimg 
+        if self.args.use_image:
+            hds = hds + himg
+            zds = zds + cimg 
 
-        if self.args.use_opticalflow ==True:
-            hds=hds + himg_op
-            zds=zds + cimg_op 
+        if self.args.use_opticalflow:
+            hds = hds + himg_op
+            zds = zds + cimg_op 
 
-        for i in range(self.args.output//self.args.skip):
-            hds, zds         = self.speed_decoder(in_sp, (hds, zds))
-            speed_output     = self.hardtanh(self.fc_speed(hds))
-            speed_outputs    = torch.cat((speed_outputs, speed_output.unsqueeze(1)), dim = 1)
-            in_sp            = speed_output.detach()
+        # 多步预测
+        for i in range(self.args.output // self.args.skip):
+            hds, zds = self.speed_decoder(in_sp, (hds, zds))
+            speed_output = self.hardtanh(self.fc_speed(hds))  # 限制输出范围
+            speed_outputs = torch.cat((speed_outputs, speed_output.unsqueeze(1)), dim=1)
+            in_sp = speed_output.detach()  # 截断梯度，避免梯度爆炸
             
         outputs.append(speed_outputs)
 
-        
+        # ========== 7. 穿越意图预测 ==========
         crossing_outputs = torch.tensor([], device=self.args.device)
-        in_cr = pos[:,-1,:]
+        in_cr = pos[:, -1, :]  # 初始输入：最后一帧的位置
         
+        # 特征融合 - 意图预测分支（重新计算以保持独立性）
         hdc = hpo + hsp
         zdc = zpo + zsp
 
-        if self.args.use_attribute == True:
-            hdc = hdc  + hpa  
-            zdc = zdc+ zpa 
+        if self.args.use_attribute:
+            hdc = hdc + hpa  
+            zdc = zdc + zpa 
             if self.args.dataset == 'jaad' or self.args.dataset == 'pie':   
-                hdc = hdc+ hsa  + hpa  + pb 
-                zdc = zdc +zpa + zsa + pb
+                hdc = hdc + hsa + hpa + pb 
+                zdc = zdc + zpa + zsa + pb
 
+        if self.args.use_image:
+            hdc = hdc + himg
+            zdc = zdc + cimg 
 
-        if self.args.use_image ==True:
-            hdc=hdc + himg
-            zdc=zdc + cimg 
+        if self.args.use_opticalflow:
+            hdc = hdc + himg_op
+            zdc = zdc + cimg_op 
 
-        if self.args.use_opticalflow ==True:
-            hdc=hdc + himg_op
-            zdc=zdc + cimg_op 
-
-        for i in range(self.args.output//self.args.skip):
-            hdc, zdc         = self.crossing_decoder(in_cr, (hdc, zdc))
-            crossing_output  = self.fc_crossing(hdc)
-            in_cr            = self.pos_embedding(hdc).detach()
-            crossing_output  = self.softmax(crossing_output)
-            crossing_outputs = torch.cat((crossing_outputs, crossing_output.unsqueeze(1)), dim = 1)
+        # 多步意图预测
+        for i in range(self.args.output // self.args.skip):
+            hdc, zdc = self.crossing_decoder(in_cr, (hdc, zdc))
+            crossing_output = self.fc_crossing(hdc)
+            in_cr = self.pos_embedding(hdc).detach()  # 更新输入
+            crossing_output = self.softmax(crossing_output)  # 归一化为概率
+            crossing_outputs = torch.cat((crossing_outputs, crossing_output.unsqueeze(1)), dim=1)
 
         outputs.append(crossing_outputs)
-    
+        
+        # 计算平均意图标签（用于评估）
         if average:
-            crossing_labels = torch.argmax(crossing_outputs, dim=2)
-            intention = torch.max(crossing_labels,dim=1)[0]
+            crossing_labels = torch.argmax(crossing_outputs, dim=2)  # 每帧预测标签
+            intention = torch.max(crossing_labels, dim=1)[0]        # 取最大投票
             outputs.append(intention)
         
-
-
         return tuple(outputs)

@@ -47,24 +47,43 @@ for video in dataset:
     print('Processing', video, '...')
     vid = dataset[video]
     data = np.empty((0,25))
+
+    frames_list = vid['ped_annotations'][list(vid['ped_annotations'].keys())[0]]['frames'] if vid['ped_annotations'] else []
+    min_frame = min(frames_list) if frames_list else 0
+    offset = min_frame
+
+    img_dir = os.path.join(data_path, 'images', video)
+    valid_frames_set = set()
+    if os.path.isdir(img_dir):
+        for f in os.listdir(img_dir):
+            if f.endswith('.jpg'):
+                try:
+                    frame_num = int(f.split('_')[-1].replace('.jpg', ''))
+                    valid_frames_set.add(frame_num + offset)
+                except:
+                    pass
+
     for ped in vid['ped_annotations']:
         if vid['ped_annotations'][ped]['behavior']:
             frames = np.array(vid['ped_annotations'][ped]['frames']).reshape(-1,1)
+            valid_mask = np.array([f[0] in valid_frames_set for f in frames])
+            frames = frames[valid_mask]
+            if len(frames) == 0:
+                continue
             ids = np.repeat(vid['ped_annotations'][ped]['old_id'], frames.shape[0]).reshape(-1,1)
-            bbox = np.array(vid['ped_annotations'][ped]['bbox'])
+            bbox = np.array(vid['ped_annotations'][ped]['bbox'])[valid_mask]
             x = bbox[:,0].reshape(-1,1)
             y = bbox[:,1].reshape(-1,1)
             w = np.abs(bbox[:,0] - bbox[:,2]).reshape(-1,1)
             h = np.abs(bbox[:,1] - bbox[:,3]).reshape(-1,1)
-            imagefolderpath = np.array([os.path.join(data_path, 'images', video, '%05d'%int(frames[fr][0])+'.png') for fr in range(0, frames.shape[0])]).reshape(-1,1)
+            imagefolderpath = np.array([os.path.join(data_path, 'images', video, '{}_{:04d}.jpg'.format(video, int(frames[fr][0]) - offset)) for fr in range(0, frames.shape[0])]).reshape(-1,1)
              
 
-            cross = np.array(vid['ped_annotations'][ped]['behavior']['cross']).reshape(-1,1)
-
-            reaction = np.array(vid['ped_annotations'][ped]['behavior']['reaction']).reshape(-1,1)
-            hand_gesture = np.array(vid['ped_annotations'][ped]['behavior']['hand_gesture']).reshape(-1,1)
-            look = np.array(vid['ped_annotations'][ped]['behavior']['look']).reshape(-1,1)
-            nod = np.array(vid['ped_annotations'][ped]['behavior']['nod']).reshape(-1,1)
+            cross = np.array(vid['ped_annotations'][ped]['behavior']['cross'])[valid_mask].reshape(-1,1)
+            reaction = np.array(vid['ped_annotations'][ped]['behavior']['reaction'])[valid_mask].reshape(-1,1)
+            hand_gesture = np.array(vid['ped_annotations'][ped]['behavior']['hand_gesture'])[valid_mask].reshape(-1,1)
+            look = np.array(vid['ped_annotations'][ped]['behavior']['look'])[valid_mask].reshape(-1,1)
+            nod = np.array(vid['ped_annotations'][ped]['behavior']['nod'])[valid_mask].reshape(-1,1)
 
 
             ####[age,gender,group_size]
@@ -72,26 +91,27 @@ for video in dataset:
             age=np.repeat(vid['ped_annotations'][ped]['attributes']['age'],frames.shape[0]).reshape(-1,1)
             gender=np.repeat(vid['ped_annotations'][ped]['attributes']['gender'],frames.shape[0]).reshape(-1,1)
             group_size=np.repeat(vid['ped_annotations'][ped]['attributes']['group_size'],frames.shape[0]).reshape(-1,1)
-           
+
 
             #### scene_attribute [road_type,designated,motion_direction,num_lanes,signalized,traffic_direction]
-            
-           
+
+
             designated=np.repeat(vid['ped_annotations'][ped]['attributes']['designated'],frames.shape[0]).reshape(-1,1)
             motion_direction=np.repeat(vid['ped_annotations'][ped]['attributes']['motion_direction'],frames.shape[0]).reshape(-1,1)
             num_lanes=np.repeat(vid['ped_annotations'][ped]['attributes']['num_lanes'],frames.shape[0]).reshape(-1,1)
             signalized=np.repeat(vid['ped_annotations'][ped]['attributes']['signalized'],frames.shape[0]).reshape(-1,1)
             traffic_direction=np.repeat(vid['ped_annotations'][ped]['attributes']['traffic_direction'],frames.shape[0]).reshape(-1,1)
             road_type=np.repeat(vid['traffic_annotations']['road_type'],frames.shape[0]).reshape(-1,1)
-            
-            
-            
-            ped_crossing,ped_sign,stop_sign,traffic_light=[],[],[],[] ##[ped_crossing,ped_sign,stop_sign,traffic_light]
-            for f in frames:
-                ped_crossing.append(vid['traffic_annotations'][f[0]]['ped_crossing'])
-                ped_sign.append(vid['traffic_annotations'][f[0]]['ped_sign'])
-                stop_sign.append(vid['traffic_annotations'][f[0]]['stop_sign'])
-                traffic_light.append(vid['traffic_annotations'][f[0]]['traffic_light'])
+
+
+
+            ped_crossing,ped_sign,stop_sign,traffic_light=[],[],[],[]
+            valid_frame_list = [f[0] for f in frames]
+            for f in valid_frame_list:
+                ped_crossing.append(vid['traffic_annotations'][f]['ped_crossing'])
+                ped_sign.append(vid['traffic_annotations'][f]['ped_sign'])
+                stop_sign.append(vid['traffic_annotations'][f]['stop_sign'])
+                traffic_light.append(vid['traffic_annotations'][f]['traffic_light'])
         
 
             ### add other behavior attributes here, reaction, hand_gesture,Look, action, nod
@@ -129,8 +149,7 @@ for video in dataset:
                                   'stop_sign': data[:,22].reshape(-1), 
                                   'traffic_light': data[:,23].reshape(-1), 
                                   'road_type': data[:,24].reshape(-1),})
-    data_to_write['filename'] = data_to_write.frame
-    data_to_write.filename = data_to_write.filename.apply(lambda x: '%05d'%int(x)+'.png')
+    data_to_write['filename'] = data_to_write.frame.apply(lambda x: '{}_{:04d}.jpg'.format(data_to_write['imagefolderpath'].iloc[0].split('/')[-2], int(x) - offset))
     
     if video in train_videos:
         data_to_write.to_csv(os.path.join(data_path, 'PN_ego', 'train', video+'.csv'), index=False)

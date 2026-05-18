@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+*.csv
+*.log
+output/
+runs/
+data/
+*.pdf
