@@ -1,6 +1,6 @@
 use_argument_parser: False
 data_dir: '/home/lbh/PTINet/data/JAAD/'
-dataset: 'fpv'
+dataset: 'T2FPV'
 out_dir: '/home/lbh/OurWork1/output/'
 
 input: 5

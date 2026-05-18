@@ -79,22 +79,64 @@ class CoFE(nn.Module):
 
     @staticmethod
     def ego_dists(hist_abs, seq_start_end):
-        hist_ego_abs = torch.zeros_like(hist_abs)
-        for (start, end) in seq_start_end:
-            hist_ego_abs[:, start:end] = (
-                hist_abs[:, start:end] - hist_abs[:, start].unsqueeze(1)
-            )
-        return hist_ego_abs
+        """
+        向量化计算每个agent相对于其场景ego的坐标偏移
+        
+        Args:
+            hist_abs: (T, N, 2) 世界坐标
+            seq_start_end: (S, 2) 场景边界索引
+        
+        Returns:
+            hist_ego_abs: (T, N, 2) ego相对坐标
+        """
+        T, N, _ = hist_abs.shape
+        device = hist_abs.device
+        
+        scene_idx = torch.zeros(N, dtype=torch.long, device=device)
+        for i, (start, end) in enumerate(seq_start_end):
+            scene_idx[start:end] = i
+        
+        ego_indices = seq_start_end[:, 0]
+        
+        ego_coords = hist_abs[:, ego_indices, :]
+        
+        indices = scene_idx.view(1, N, 1).expand(T, N, 2)
+        result = ego_coords.gather(dim=1, index=indices)
+        
+        return hist_abs - result
 
     @staticmethod
     def encode_yaw(hist_yaw, seq_start_end):
-        offset_yaw_rel = torch.zeros_like(hist_yaw)
-        for (start, end) in seq_start_end:
-            offset_yaw_rel[:, start:end] = (
-                hist_yaw[:, start:end] - hist_yaw[:, start].unsqueeze(1)
-            )
+        """
+        向量化计算偏航角的ego相对编码
+        
+        Args:
+            hist_yaw: (T, N) 原始偏航角
+            seq_start_end: (S, 2) 场景边界索引
+        
+        Returns:
+            yaw_enc: (T, N, 2) cos/sin编码的偏航角
+        """
+        T, N = hist_yaw.shape
+        device = hist_yaw.device
+        
+        scene_idx = torch.zeros(N, dtype=torch.long, device=device)
+        for i, (start, end) in enumerate(seq_start_end):
+            scene_idx[start:end] = i
+        
+        ego_indices = seq_start_end[:, 0]
+        
+        ego_yaw = hist_yaw[:, ego_indices]
+        
+        indices = scene_idx.view(1, N).expand(T, N)
+        result = ego_yaw.gather(dim=1, index=indices)
+        
+        offset_yaw_rel = hist_yaw - result
+        
         offset_yaw_norm = ((180 + offset_yaw_rel) % 360 - 180)
+        
         offset_yaw_rad = torch.deg2rad(offset_yaw_norm)
+        
         return torch.stack([torch.cos(offset_yaw_rad), torch.sin(offset_yaw_rad)], dim=-1)
 
     def build_features(self, hist_abs_pred, hist_yaw_pred, hist_seq_start_end):
