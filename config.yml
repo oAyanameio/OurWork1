@@ -34,3 +34,4 @@ use_cofe: True
 cofe_hidden_size: 96
 cofe_num_layers: 2
 cofe_use_resnet: False
+cofe_loss_weight: 0.0  # >0 时把 CoFE 轨迹修正监督损失加入端到端训练
