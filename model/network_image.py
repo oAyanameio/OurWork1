@@ -68,6 +68,13 @@ class PTINet(nn.Module):
         elif args.dataset == 'titan':
             self.size = 4
             self.ped_behavior_size = 3
+
+        elif args.dataset == 'fpv':
+            self.size = 2                    # 世界坐标 (x, y)
+            self.ped_attribute_size = 3      # 默认值，FPV数据中不使用
+            self.ped_behavior_size = 3       # 默认值，FPV数据中不使用
+            self.scene_attribute_size = 4    # 默认值，FPV数据中不使用
+
         else:
             raise ValueError('Wrong dataset name!')
 
@@ -121,7 +128,11 @@ class PTINet(nn.Module):
 
         # ========== 视觉编码器模块 ==========
         if args.use_image:
-            if args.image_network == 'resnet50':
+            if args.dataset == 'fpv':
+                # FPV模式：使用预提取的ResNet特征 (T, N, 2048) 通过LSTM编码
+                self.fpv_resnet_lstm = nn.LSTM(2048, args.hidden_size, batch_first=True)
+
+            elif args.image_network == 'resnet50':
                 # 使用ResNet50提取图像特征
                 self.resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
                 self.resnet.fc = nn.Identity()  # 移除分类层
@@ -175,11 +186,18 @@ class PTINet(nn.Module):
 
         # ========== CoFE轨迹去噪修复模块 ==========
         if args.use_cofe:
-            self.cofe = CoFE(
+            cofe_kwargs = dict(
                 input_size=self.size,
                 hidden_size=args.cofe_hidden_size,
-                num_layers=args.cofe_num_layers
+                num_layers=args.cofe_num_layers,
             )
+            if args.dataset == 'fpv':
+                cofe_kwargs.update(dict(
+                    use_resnet=getattr(args, 'cofe_use_resnet', False),
+                    no_abs=True,
+                    idxs=[6, 7],
+                ))
+            self.cofe = CoFE(**cofe_kwargs)
 
         # ========== 解码器模块 ==========
         # 位置嵌入层 - 将隐藏状态映射回位置空间
@@ -228,7 +246,8 @@ class PTINet(nn.Module):
         
     def forward(self, speed=None, pos=None, ped_attribute=None, 
                 ped_behavior=None, scene_attribute=None, images=None, 
-                optical=None, average=False):
+                optical=None, average=False, hist_all=None, 
+                hist_resnet=None, hist_seq_start_end=None):
         """
         前向传播函数
         
@@ -241,14 +260,26 @@ class PTINet(nn.Module):
             images: 图像序列, shape=(batch_size, input_len, 3, H, W)
             optical: 光流序列, shape=(batch_size, input_len, 4, H, W)
             average: 是否计算平均意图标签
+            hist_all: (FPV模式) 多agent历史数据, shape=(timesteps, num_agents, 7)
+            hist_resnet: (FPV模式) 预提取ResNet特征, shape=(timesteps, num_agents, 2048)
+            hist_seq_start_end: (FPV模式) 场景边界索引, shape=(num_scenes, 2)
             
         Returns:
             tuple: 包含以下元素的元组：
                 [0] - 总重构损失
-                [1] - 速度预测输出, shape=(batch_size, output_len, 4)
+                [1] - 速度预测输出, shape=(batch_size, output_len, size)
                 [2] - 穿越意图预测, shape=(batch_size, output_len, 2)
                 [3] - (可选)平均意图标签, shape=(batch_size,)
         """
+
+        # FPV数据流调度
+        if self.args.dataset == 'fpv':
+            return self.forward_fpv(
+                hist_all=hist_all,
+                hist_resnet=hist_resnet,
+                hist_seq_start_end=hist_seq_start_end,
+                average=average
+            )
 
         # ========== 0. CoFE轨迹修复（可选） ==========
         # 流程: batch_first -> seq_first -> CoFE去噪 -> batch_first -> LSTM-VAE
@@ -413,4 +444,123 @@ class PTINet(nn.Module):
             intention = torch.max(crossing_labels, dim=1)[0]        # 取最大投票
             outputs.append(intention)
         
+        return tuple(outputs)
+
+    def forward_fpv(self, hist_all, hist_resnet=None, hist_seq_start_end=None, average=False):
+        """
+        FPV模式前向传播
+
+        输入FPV数据集格式的多agent轨迹数据，执行完整预测流程：
+        1. CoFE轨迹去噪修复（使用yaw编码和ego相对距离）
+        2. LSTMVAE编码（位置+速度）
+        3. 缺失模态填充（属性/行为/场景/光流 → 零张量）
+        4. ResNet视觉特征编码（通过fpv_resnet_lstm）
+        5. 特征融合与双任务解码
+
+        Args:
+            hist_all: 多agent历史数据, shape=(timesteps, num_agents, 7)
+                      [x_world, y_world, yaw, img_x, img_y, valid, agent_id]
+            hist_resnet: 预提取ResNet特征, shape=(timesteps, num_agents, 2048)
+            hist_seq_start_end: 场景边界索引, shape=(num_scenes, 2)
+            average: 是否计算平均意图标签
+
+        Returns:
+            tuple: (loss, speed_outputs, crossing_outputs, [intention])
+        """
+        T, N, _ = hist_all.shape
+        device = hist_all.device
+
+        # 1. 拆分FPV数据
+        hist_abs = hist_all[..., :2]   # (T, N, 2) 世界坐标
+        hist_yaw = hist_all[..., 2]    # (T, N) 偏航角
+
+        # 2. CoFE轨迹修正（完整FPV版：含yaw编码、ego_dists、ResNet融合）
+        if self.args.use_cofe:
+            corrected = self.cofe.infer_correction(
+                hist_abs, hist_yaw, hist_resnet, hist_seq_start_end
+            )
+        else:
+            corrected = hist_abs
+
+        # 3. 维度转换 (T, N, 2) → (N, T, 2) batch_first格式
+        pos = corrected.permute(1, 0, 2).contiguous()
+
+        # 4. 速度重计算（物理一致性）
+        speed = torch.zeros_like(pos)
+        speed[:, 1:] = pos[:, 1:] - pos[:, :-1]
+
+        # 5. LSTMVAE编码
+        sloss, _, zsp, hsp, _ = self.speed_encoder(speed)
+        hsp = hsp[0].squeeze(0)
+        zsp = torch.mean(zsp, axis=1)
+
+        ploss, _, zpo, hpo, _ = self.pos_encoder(pos)
+        hpo = hpo[0].squeeze(0)
+        zpo = torch.mean(zpo, axis=1)
+
+        # 6. 缺失模态 → 零张量（FPV数据不含这些模态）
+        batch = N
+        hidden_size = self.args.hidden_size
+
+        hpa = torch.zeros(batch, hidden_size, device=device)
+        hsa = torch.zeros(batch, hidden_size, device=device)
+        zpa = torch.zeros(batch, hidden_size, device=device)
+        zsa = torch.zeros(batch, hidden_size, device=device)
+        pb = torch.zeros(batch, hidden_size, device=device)
+        pbloss = torch.zeros(1, device=device)
+        psloss = torch.zeros(1, device=device)
+
+        # 7. ResNet视觉特征编码
+        if self.args.use_image and hist_resnet is not None and hasattr(self, 'fpv_resnet_lstm'):
+            resnet_feat = hist_resnet.permute(1, 0, 2)
+            _, (h_fpv_im, c_fpv_im) = self.fpv_resnet_lstm(resnet_feat)
+            him = h_fpv_im[-1].squeeze(0)
+            cim = c_fpv_im[-1].squeeze(0)
+        else:
+            him = torch.zeros(batch, hidden_size, device=device)
+            cim = torch.zeros(batch, hidden_size, device=device)
+
+        # 光流（FPV不含）
+        hop = torch.zeros(batch, hidden_size, device=device)
+        cop = torch.zeros(batch, hidden_size, device=device)
+
+        # 8. 总重构损失
+        outputs = [ploss + sloss + pbloss + psloss]
+
+        # 9. 速度轨迹预测
+        speed_outputs = torch.tensor([], device=device)
+        in_sp = speed[:, -1, :]
+
+        hds = hpo + hsp + hpa + hsa + pb + him + hop
+        zds = zpo + zpa + zsa + pb + cim + cop
+
+        for i in range(self.args.output // self.args.skip):
+            hds, zds = self.speed_decoder(in_sp, (hds, zds))
+            speed_output = self.hardtanh(self.fc_speed(hds))
+            speed_outputs = torch.cat((speed_outputs, speed_output.unsqueeze(1)), dim=1)
+            in_sp = speed_output.detach()
+
+        outputs.append(speed_outputs)
+
+        # 10. 穿越意图预测
+        crossing_outputs = torch.tensor([], device=device)
+        in_cr = pos[:, -1, :]
+
+        hdc = hpo + hsp + hpa + hsa + pb + him + hop
+        zdc = zpo + zpa + zsa + pb + cim + cop
+
+        for i in range(self.args.output // self.args.skip):
+            hdc, zdc = self.crossing_decoder(in_cr, (hdc, zdc))
+            crossing_output = self.fc_crossing(hdc)
+            in_cr = self.pos_embedding(hdc).detach()
+            crossing_output = self.softmax(crossing_output)
+            crossing_outputs = torch.cat((crossing_outputs, crossing_output.unsqueeze(1)), dim=1)
+
+        outputs.append(crossing_outputs)
+
+        if average:
+            crossing_labels = torch.argmax(crossing_outputs, dim=2)
+            intention = torch.max(crossing_labels, dim=1)[0]
+            outputs.append(intention)
+
         return tuple(outputs)

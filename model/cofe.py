@@ -24,86 +24,159 @@ class CoFE(nn.Module):
     """
     CoFE: Correction Feature Embedding（轨迹去噪修复模块）
 
-    基于GRU编码器-解码器架构，对第一视角下带噪声的检测轨迹进行去噪修复。
-    本模块适配PTINet的BEV视角轨迹预测，简化了T2FPV原始实现中的
-    yaw角度编码、ResNet视觉融合、ego相对距离等FPV特有组件，
-    仅对轨迹序列本身进行编解码修复。
+    FPV（第一人称视角）完整版本，匹配T2FPV原始实现。
 
-    架构:
-        f_offset:    轨迹特征编码器MLP
-        corr_enc:    融合编码器MLP（拼接编码特征和GRU隐状态）
-        corr_rnn:    编码器GRU
-        corr_dec_rnn:解码器GRU
-        corr_dec:    输出解码器MLP
+    核心能力:
+      - 偏航角编码：4步变换（ego相对化 → 归一化 → 弧度化 → cos/sin编码）
+      - Ego相对距离：通过seq_start_end计算相对于自车的坐标
+      - ResNet视觉融合：可选，融合2048维ResNet特征
+      - 帧间位移修正：在位移空间中做GRU编解码
+      - 绝对坐标恢复：cumsum + initial_pos
+
+    特征空间（8维，no_abs=True）:
+      dims 0-1: xy - xy[0]        相对首帧位移
+      dims 2-3: offset_xy          ego相对坐标
+      dims 4-5: cos/sin(yaw)      偏航角编码
+      dims 6-7: rel                帧间位移（速度）
+      通过 idxs 参数选择子集送入GRU（默认[6,7]只选位移）
 
     数据流:
-        1. 编码阶段：逐时间步将输入轨迹编码到隐空间
-        2. 解码阶段：从隐状态逐时间步解码出修正后的轨迹
+      绝对坐标 → 特征构建 → idxs选择 → GRU编码 → GRU解码 → 位移还原 → 修正后绝对坐标
     """
 
-    def __init__(self, input_size=4, hidden_size=96, num_layers=2):
+    def __init__(self, input_size=2, hidden_size=96, num_layers=2,
+                 use_resnet=False, no_abs=True, idxs=None):
         super().__init__()
 
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.no_abs = no_abs
+        self.use_resnet = use_resnet
+        self.idxs = idxs if idxs is not None else [6, 7]
+        self.offset_idxs = torch.tensor(self.idxs, dtype=torch.long)
+        self.feat_dim = len(self.idxs)
 
-        self.f_offset = MLP(input_size, [hidden_size], hidden_size)
-        self.corr_enc = MLP(hidden_size * 2, [hidden_size, 64], hidden_size)
+        self.f_offset = MLP(self.feat_dim, [hidden_size], hidden_size)
+
+        if use_resnet:
+            self.f_resnet = MLP(2048, [hidden_size], hidden_size)
+            corr_enc_in = hidden_size * 3
+        else:
+            self.f_resnet = None
+            corr_enc_in = hidden_size * 2
+
+        self.corr_enc = MLP(corr_enc_in, [hidden_size, 64], hidden_size)
         self.corr_rnn = nn.GRU(hidden_size, hidden_size, num_layers)
         self.corr_dec_rnn = nn.GRU(hidden_size, hidden_size, num_layers)
-        self.corr_dec = MLP(hidden_size, [64, hidden_size], input_size)
+        self.corr_dec = MLP(hidden_size, [64, hidden_size], self.feat_dim)
 
-    def infer_correction(
-        self,
-        hist_abs_pred,
-        hist_yaw_pred=None,
-        hist_resnet=None,
-        hist_seq_start_end=None,
-    ):
-        """
-        CoFE推理修正接口 —— 完整保留T2FPV原始设计中的坐标转换逻辑
+        self.criterion = nn.MSELoss()
 
-        内部流程:
-          1. 编码阶段: 绝对坐标 → 帧间位移 → 逐时间步编码到隐空间
-          2. 解码阶段: 从隐状态逐时间步解码出修正后帧间位移
-          3. 输出阶段: 累积和 + 初始位置 → 修正后绝对坐标
+    def to(self, *args, **kwargs):
+        self.offset_idxs = self.offset_idxs.to(*args, **kwargs)
+        return super().to(*args, **kwargs)
 
-        这样GRU在数值稳定、分布一致的位移空间中学习修正，
-        而非在大范围变化绝对坐标空间中学习，大幅降低学习难度。
+    @staticmethod
+    def ego_dists(hist_abs, seq_start_end):
+        hist_ego_abs = torch.zeros_like(hist_abs)
+        for (start, end) in seq_start_end:
+            hist_ego_abs[:, start:end] = (
+                hist_abs[:, start:end] - hist_abs[:, start].unsqueeze(1)
+            )
+        return hist_ego_abs
 
-        Args:
-            hist_abs_pred:    带噪声的轨迹序列
-                              形状: (timesteps, num_agents, input_size)
-            hist_yaw_pred:    可选（PTINet未使用）
-            hist_resnet:      可选（PTINet未使用）
-            hist_seq_start_end: 可选（PTINet未使用）
+    @staticmethod
+    def encode_yaw(hist_yaw, seq_start_end):
+        offset_yaw_rel = torch.zeros_like(hist_yaw)
+        for (start, end) in seq_start_end:
+            offset_yaw_rel[:, start:end] = (
+                hist_yaw[:, start:end] - hist_yaw[:, start].unsqueeze(1)
+            )
+        offset_yaw_norm = ((180 + offset_yaw_rel) % 360 - 180)
+        offset_yaw_rad = torch.deg2rad(offset_yaw_norm)
+        return torch.stack([torch.cos(offset_yaw_rad), torch.sin(offset_yaw_rad)], dim=-1)
 
-        Returns:
-            corrected: 修正后的轨迹序列，形状同输入
-        """
+    def build_features(self, hist_abs_pred, hist_yaw_pred, hist_seq_start_end):
+        xy_pred = hist_abs_pred
+        rel_pred = torch.zeros_like(xy_pred)
+        rel_pred[1:] = xy_pred[1:] - xy_pred[:-1]
+        offset_xy_pred = self.ego_dists(xy_pred, hist_seq_start_end)
+        offset_yaw_pred = self.encode_yaw(hist_yaw_pred, hist_seq_start_end)
+
+        if self.no_abs:
+            offset_pred = torch.cat([
+                xy_pred - xy_pred[0],
+                offset_xy_pred,
+                offset_yaw_pred,
+                rel_pred
+            ], dim=-1)
+        else:
+            offset_pred = torch.cat([
+                xy_pred,
+                offset_xy_pred,
+                offset_yaw_pred,
+                rel_pred
+            ], dim=-1)
+
+        return offset_pred[..., self.offset_idxs]
+
+    def train_correction(self, hist_abs_gt, hist_yaw_gt, hist_abs_pred,
+                         hist_yaw_pred, hist_resnet, hist_seq_start_end):
+        timesteps, num_agents, _ = hist_abs_gt.shape
+        device = hist_abs_gt.device
+
+        MSE = torch.zeros(1).to(device)
+        h = torch.zeros(self.num_layers, num_agents, self.hidden_size, device=device)
+
+        offset_gt = self.build_features(hist_abs_gt, hist_yaw_gt, hist_seq_start_end)
+        offset_pred = self.build_features(hist_abs_pred, hist_yaw_pred, hist_seq_start_end)
+
+        for t in range(timesteps):
+            f_offset_t = self.f_offset(offset_pred[t])
+            if self.f_resnet is not None:
+                f_resnet_t = self.f_resnet(hist_resnet[t])
+            else:
+                f_resnet_t = torch.empty((offset_pred[t].shape[0], 0), device=device)
+            x_enc = torch.cat([f_offset_t, f_resnet_t, h[-1]], dim=-1)
+            x_corr = self.corr_enc(x_enc)
+            _, h = self.corr_rnn(x_corr.unsqueeze(0), h)
+
+        for t in range(timesteps):
+            x_dec = self.corr_dec(h[-1])
+            MSE += torch.sqrt(self.criterion(x_dec, offset_gt[t]))
+            x_dec_feat = self.f_offset(x_dec)
+            _, h = self.corr_dec_rnn(x_dec_feat.unsqueeze(0), h)
+
+        return MSE
+
+    def infer_correction(self, hist_abs_pred, hist_yaw_pred=None,
+                         hist_resnet=None, hist_seq_start_end=None):
         timesteps, num_agents, _ = hist_abs_pred.shape
         device = hist_abs_pred.device
 
-        # === 步骤1: 绝对坐标 → 帧间位移（相对位移） ===
-        # T2FPV原始设计: 在位移空间中做修正，而非绝对坐标空间
-        # rel_pred[t] = pos[t] - pos[t-1], rel_pred[0] = 0
         rel_pred = torch.zeros_like(hist_abs_pred)
         rel_pred[1:] = hist_abs_pred[1:] - hist_abs_pred[:-1]
-        initial_pos = hist_abs_pred[0:1]
 
-        # === 步骤2: GRU编码器-解码器在位移空间中处理 ===
+        if hist_yaw_pred is not None and hist_seq_start_end is not None:
+            offset_pred = self.build_features(
+                hist_abs_pred, hist_yaw_pred, hist_seq_start_end
+            )
+        else:
+            offset_pred = rel_pred
+
         h = torch.zeros(self.num_layers, num_agents, self.hidden_size, device=device)
 
-        # 编码阶段：逐时间步读入帧间位移
         for t in range(timesteps):
-            x_t = rel_pred[t]
-            f_t = self.f_offset(x_t)
-            enc_input = torch.cat([f_t, h[-1]], dim=-1)
-            enc_out = self.corr_enc(enc_input)
-            _, h = self.corr_rnn(enc_out.unsqueeze(0), h)
+            f_offset_t = self.f_offset(offset_pred[t])
+            if self.f_resnet is not None and hist_resnet is not None:
+                f_resnet_t = self.f_resnet(hist_resnet[t])
+            else:
+                f_resnet_t = torch.empty((offset_pred[t].shape[0], 0), device=device)
+            x_enc = torch.cat([f_offset_t, f_resnet_t, h[-1]], dim=-1)
+            x_corr = self.corr_enc(x_enc)
+            _, h = self.corr_rnn(x_corr.unsqueeze(0), h)
 
-        # 解码阶段：从隐状态逐时间步生成修正后帧间位移
         outputs = []
         for t in range(timesteps):
             dec_out = self.corr_dec(h[-1])
@@ -111,29 +184,16 @@ class CoFE(nn.Module):
             dec_feat = self.f_offset(dec_out)
             _, h = self.corr_dec_rnn(dec_feat.unsqueeze(0), h)
 
-        corrected_rel = torch.cat(outputs, dim=0)
+        samples = torch.cat(outputs, dim=0)
 
-        # === 步骤3: 帧间位移 → 累积和 + 初始位置 → 修正后绝对坐标 ===
-        # T2FPV原始设计: cumsum + xy_pred[0] 恢复绝对坐标
-        corrected = torch.cumsum(corrected_rel, dim=0) + initial_pos
+        if self.no_abs and hist_yaw_pred is not None and hist_seq_start_end is not None:
+            samples = torch.cumsum(samples[..., -2:], dim=0) + hist_abs_pred[0:1]
+        else:
+            samples = torch.cumsum(samples, dim=0) + hist_abs_pred[0:1]
 
-        return corrected
+        return samples
 
     def forward(self, x):
-        """
-        前向传播（简便接口）
-
-        与PTINet原生的batch_first格式直接兼容，
-        内部自动permute后调用infer_correction再permute回来。
-
-        Args:
-            x: 带噪声的轨迹序列
-               形状: (batch_size, seq_len, input_size)
-
-        Returns:
-            corrected: 修正后的轨迹序列
-                       形状: (batch_size, seq_len, input_size)
-        """
         pos_seq_first = x.permute(1, 0, 2)
         corrected_seq_first = self.infer_correction(pos_seq_first)
         return corrected_seq_first.permute(1, 0, 2)
