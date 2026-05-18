@@ -62,35 +62,48 @@ class CoFE(nn.Module):
         hist_seq_start_end=None,
     ):
         """
-        CoFE推理修正接口 —— 严格遵循T2FPV原始设计风格
+        CoFE推理修正接口 —— 完整保留T2FPV原始设计中的坐标转换逻辑
 
-        编码器逐时间步读入带噪声轨迹，解码器从隐状态逐时间步生成修正轨迹。
+        内部流程:
+          1. 编码阶段: 绝对坐标 → 帧间位移 → 逐时间步编码到隐空间
+          2. 解码阶段: 从隐状态逐时间步解码出修正后帧间位移
+          3. 输出阶段: 累积和 + 初始位置 → 修正后绝对坐标
+
+        这样GRU在数值稳定、分布一致的位移空间中学习修正，
+        而非在大范围变化绝对坐标空间中学习，大幅降低学习难度。
 
         Args:
             hist_abs_pred:    带噪声的轨迹序列
                               形状: (timesteps, num_agents, input_size)
-                              说明: 时间步在第0维，与T2FPV原始设计一致
-            hist_yaw_pred:    可选，偏航角数据（PTINet中未使用，保留接口兼容）
-            hist_resnet:      可选，ResNet视觉特征（PTINet中未使用，保留接口兼容）
-            hist_seq_start_end: 可选，场景边界索引（PTINet中未使用，保留接口兼容）
+            hist_yaw_pred:    可选（PTINet未使用）
+            hist_resnet:      可选（PTINet未使用）
+            hist_seq_start_end: 可选（PTINet未使用）
 
         Returns:
-            corrected: 修正后的轨迹序列
-                       形状: (timesteps, num_agents, input_size)
-                       与输入形状相同，仅内容被修复
+            corrected: 修正后的轨迹序列，形状同输入
         """
         timesteps, num_agents, _ = hist_abs_pred.shape
         device = hist_abs_pred.device
 
+        # === 步骤1: 绝对坐标 → 帧间位移（相对位移） ===
+        # T2FPV原始设计: 在位移空间中做修正，而非绝对坐标空间
+        # rel_pred[t] = pos[t] - pos[t-1], rel_pred[0] = 0
+        rel_pred = torch.zeros_like(hist_abs_pred)
+        rel_pred[1:] = hist_abs_pred[1:] - hist_abs_pred[:-1]
+        initial_pos = hist_abs_pred[0:1]
+
+        # === 步骤2: GRU编码器-解码器在位移空间中处理 ===
         h = torch.zeros(self.num_layers, num_agents, self.hidden_size, device=device)
 
+        # 编码阶段：逐时间步读入帧间位移
         for t in range(timesteps):
-            x_t = hist_abs_pred[t]
+            x_t = rel_pred[t]
             f_t = self.f_offset(x_t)
             enc_input = torch.cat([f_t, h[-1]], dim=-1)
             enc_out = self.corr_enc(enc_input)
             _, h = self.corr_rnn(enc_out.unsqueeze(0), h)
 
+        # 解码阶段：从隐状态逐时间步生成修正后帧间位移
         outputs = []
         for t in range(timesteps):
             dec_out = self.corr_dec(h[-1])
@@ -98,7 +111,13 @@ class CoFE(nn.Module):
             dec_feat = self.f_offset(dec_out)
             _, h = self.corr_dec_rnn(dec_feat.unsqueeze(0), h)
 
-        return torch.cat(outputs, dim=0)
+        corrected_rel = torch.cat(outputs, dim=0)
+
+        # === 步骤3: 帧间位移 → 累积和 + 初始位置 → 修正后绝对坐标 ===
+        # T2FPV原始设计: cumsum + xy_pred[0] 恢复绝对坐标
+        corrected = torch.cumsum(corrected_rel, dim=0) + initial_pos
+
+        return corrected
 
     def forward(self, x):
         """
