@@ -55,13 +55,10 @@ def test_ptinet_integration():
         )
 
     print(f"输出数量: {len(result)}")
-    assert len(result) == 3
+    assert len(result) == 2
     print(f"轨迹预测形状: {result[1].shape}")
-    print(f"意图预测形状: {result[2].shape}")
     assert result[1].shape == (N, args.output // args.skip, 2)
-    assert result[2].shape == (N, args.output // args.skip, 2)
     assert not torch.isnan(result[1]).any()
-    assert not torch.isnan(result[2]).any()
 
     print("✅ FPV 模式前向传播成功!")
     print("\n" + "=" * 60)
@@ -114,11 +111,9 @@ def test_t2fpv_batch_first_and_cofe_gradients():
     # 模拟可用于 CoFE 监督的干净历史轨迹，用于验证联合训练时 CoFE 有梯度。
     hist_abs_gt = hist_all[..., :2] + 0.01 * torch.randn(batch, timesteps, 2, device=device)
     target_speed = torch.randn(batch, 3, 2, device=device)
-    target_cross = torch.softmax(torch.randn(batch, 3, 2, device=device), dim=-1)
 
-    mloss, speed_preds, crossing_preds = model(hist_all=hist_all, hist_abs_gt=hist_abs_gt)
+    mloss, speed_preds = model(hist_all=hist_all, hist_abs_gt=hist_abs_gt)
     loss = mloss + torch.nn.functional.mse_loss(speed_preds, target_speed)
-    loss = loss + torch.nn.functional.binary_cross_entropy(crossing_preds, target_cross)
     loss.backward()
 
     grad_norm = sum(
@@ -158,7 +153,6 @@ def test_t2fpv_resnet_cofe_without_features_uses_zero_fallback():
     with torch.no_grad():
         outputs = model(hist_all=hist_all)
     assert outputs[1].shape == (2, 3, 2)
-    assert outputs[2].shape == (2, 3, 2)
 
 
 if __name__ == "__main__":

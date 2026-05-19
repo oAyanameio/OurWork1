@@ -115,6 +115,13 @@ class PTINet(nn.Module):
                     nn.Linear(64, args.hidden_size),
                     nn.ReLU()
                 )
+        self.intent_feature_dim = getattr(args, 'intent_feature_dim', 0)
+        self.intent_proj = None
+        if self.intent_feature_dim and self.intent_feature_dim > 0:
+            self.intent_proj = nn.Sequential(
+                nn.Linear(self.intent_feature_dim, args.hidden_size),
+                nn.ReLU(),
+            )
 
         if args.use_image:
             if args.dataset == 'T2FPV':
@@ -188,26 +195,9 @@ class PTINet(nn.Module):
             input_size=self.size, 
             hidden_size=args.hidden_size
         )
-        self.crossing_decoder = nn.LSTMCell(
-            input_size=self.size, 
-            hidden_size=args.hidden_size
-        )
-        self.attrib_decoder = nn.LSTMCell(
-            input_size=self.size, 
-            hidden_size=args.hidden_size
-        )
-        
         self.fc_speed = nn.Linear(
             in_features=args.hidden_size, 
             out_features=self.size
-        )
-        self.fc_crossing = nn.Sequential(
-            nn.Linear(in_features=args.hidden_size, out_features=2),
-            nn.ReLU()
-        )
-        self.fc_attrib = nn.Sequential(
-            nn.Linear(in_features=args.hidden_size, out_features=3),
-            nn.ReLU()
         )
         
         self.hardtanh = nn.Hardtanh(
@@ -291,7 +281,7 @@ class PTINet(nn.Module):
         return hist_all, hist_resnet, hist_seq_start_end
         
     def forward(self, speed=None, pos=None, ped_attribute=None, 
-                ped_behavior=None, scene_attribute=None, images=None, optical=None, average=False, hist_all=None, hist_resnet=None, hist_seq_start_end=None, hist_yaw=None, hist_abs_gt=None, hist_yaw_gt=None):
+                ped_behavior=None, scene_attribute=None, images=None, optical=None, average=False, hist_all=None, hist_resnet=None, hist_seq_start_end=None, hist_yaw=None, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None):
         if self.args.dataset == 'T2FPV':
             # T2FPV/机器人第一视角走专用 FPV 分支：优先使用完整 hist_all，
             # 否则兼容旧 PTINet 数据管线中的 pos 输入。
@@ -304,6 +294,7 @@ class PTINet(nn.Module):
                 average=average,
                 hist_abs_gt=hist_abs_gt,
                 hist_yaw_gt=hist_yaw_gt,
+                intent_feature=intent_feature,
             )
 
         if self.args.use_cofe and pos is not None:
@@ -403,6 +394,10 @@ class PTINet(nn.Module):
         if self.args.use_opticalflow:
             hds = hds + himg_op
             zds = zds + cimg_op
+        if self.intent_proj is not None and intent_feature is not None:
+            intent_emb = self.intent_proj(intent_feature)
+            hds = hds + intent_emb
+            zds = zds + intent_emb
 
         for i in range(self.args.output // self.args.skip):
             hds, zds = self.speed_decoder(in_sp, (hds, zds))
@@ -412,44 +407,9 @@ class PTINet(nn.Module):
             
         outputs.append(speed_outputs)
 
-        crossing_outputs = torch.tensor([], device=self.args.device)
-        in_cr = pos[:, -1, :]
-        
-        hdc = hpo + hsp
-        zdc = zpo + zsp
-
-        if self.args.use_attribute:
-            hdc = hdc + hpa
-            zdc = zdc + zpa
-            if self.args.dataset == 'jaad' or self.args.dataset == 'pie':   
-                hdc = hdc + hsa + pb
-                zdc = zdc + zsa + pb
-
-        if self.args.use_image:
-            hdc = hdc + himg
-            zdc = zdc + cimg
-
-        if self.args.use_opticalflow:
-            hdc = hdc + himg_op
-            zdc = zdc + cimg_op
-
-        for i in range(self.args.output // self.args.skip):
-            hdc, zdc = self.crossing_decoder(in_cr, (hdc, zdc))
-            crossing_output = self.fc_crossing(hdc)
-            in_cr = self.pos_embedding(hdc).detach()
-            crossing_output = self.softmax(crossing_output)
-            crossing_outputs = torch.cat((crossing_outputs, crossing_output.unsqueeze(1)), dim=1)
-
-        outputs.append(crossing_outputs)
-        
-        if average:
-            crossing_labels = torch.argmax(crossing_outputs, dim=2)
-            intention = torch.max(crossing_labels, dim=1)[0]
-            outputs.append(intention)
-        
         return tuple(outputs)
 
-    def forward_fpv(self, hist_all, hist_resnet=None, hist_seq_start_end=None, average=False, hist_abs_gt=None, hist_yaw_gt=None):
+    def forward_fpv(self, hist_all, hist_resnet=None, hist_seq_start_end=None, average=False, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None):
         # 所有 FPV 输入先规范为 (T, N, F)，避免 CoFE 和 PTINet 编码器理解的维度不一致。
         hist_all, hist_resnet, hist_seq_start_end = self._normalize_fpv_inputs(
             hist_all, hist_resnet, hist_seq_start_end
@@ -526,6 +486,12 @@ class PTINet(nn.Module):
 
         hds = hpo + hsp + hpa + hsa + pb + him + hop
         zds = zpo + zsp + zpa + zsa + pb + cim + cop
+        if self.intent_proj is not None and intent_feature is not None:
+            if intent_feature.dim() == 3:
+                intent_feature = intent_feature.mean(dim=1)
+            intent_emb = self.intent_proj(intent_feature)
+            hds = hds + intent_emb
+            zds = zds + intent_emb
 
         for i in range(self.args.output // self.args.skip):
             hds, zds = self.speed_decoder(in_sp, (hds, zds))
@@ -534,25 +500,5 @@ class PTINet(nn.Module):
             in_sp = speed_output.detach()
 
         outputs.append(speed_outputs)
-
-        crossing_outputs = torch.tensor([], device=device)
-        in_cr = pos[:, -1, :]
-
-        hdc = hpo + hsp + hpa + hsa + pb + him + hop
-        zdc = zpo + zsp + zpa + zsa + pb + cim + cop
-
-        for i in range(self.args.output // self.args.skip):
-            hdc, zdc = self.crossing_decoder(in_cr, (hdc, zdc))
-            crossing_output = self.fc_crossing(hdc)
-            in_cr = self.pos_embedding(hdc).detach()
-            crossing_output = self.softmax(crossing_output)
-            crossing_outputs = torch.cat((crossing_outputs, crossing_output.unsqueeze(1)), dim=1)
-
-        outputs.append(crossing_outputs)
-
-        if average:
-            crossing_labels = torch.argmax(crossing_outputs, dim=2)
-            intention = torch.max(crossing_labels, dim=1)[0]
-            outputs.append(intention)
 
         return tuple(outputs)

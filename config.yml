@@ -29,6 +29,7 @@ use_image: True
 image_network: 'clstm'
 use_attribute: False
 use_opticalflow: False
+intent_feature_dim: 0  # 若使用VLM意图特征，设置其维度（如512/1024）
     # cofe
 use_cofe: True
 cofe_hidden_size: 96

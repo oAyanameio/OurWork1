@@ -266,6 +266,12 @@ def train(args, train_set, val_set):
     best_ade = float('inf')  # 最佳 ADE 指标（用于保存最优模型）
     writer = SummaryWriter() # TensorBoard 日志记录器
 
+    def _maybe_intent_feature(batch):
+        for key in ('intent_feature', 'vlm_intent_feature', 'intention_feature'):
+            if key in batch:
+                return batch[key].cuda(non_blocking=True)
+        return None
+
     for epoch in range(args.n_epochs):
         """
         训练轮次循环（分布式版本）
@@ -308,18 +314,17 @@ def train(args, train_set, val_set):
             future_speed = inputs['future_speed'].cuda(non_blocking=True) # 未来速度序列 [B, output_len, 2]
             pos = inputs['pos'].cuda(non_blocking=True)                  # 历史位置序列 [B, input_len, 2]
             future_pos = inputs['future_pos'].cuda(non_blocking=True)    # 未来位置序列 [B, output_len, 2]
-            future_cross = inputs['future_cross'].cuda(non_blocking=True)# 未来穿越状态 [B, output_len, 2]
             optical = inputs['optical'].cuda(non_blocking=True)          # 光流特征
             ped_behavior = inputs['ped_behavior'].cuda(non_blocking=True)# 行人行为特征
             images = inputs['image'].cuda(non_blocking=True)             # 图像特征
-            label_c = inputs['cross_label'].cuda(non_blocking=True)      # 穿越意图标签
             ped_attribute = inputs['ped_attribute'].cuda(non_blocking=True) # 行人属性特征
             scene_attribute = inputs['scene_attribute'].cuda(non_blocking=True) # 场景属性特征
+            intent_feature = _maybe_intent_feature(inputs)               # VLM提取的意图辅助特征（可选）
             
             net.zero_grad()  # 清空梯度
             
             # 前向传播：average=False 表示训练模式，不计算意图概率
-            mloss, speed_preds, crossing_preds = net(
+            mloss, speed_preds = net(
                 speed=speed, 
                 pos=pos,
                 ped_attribute=ped_attribute,
@@ -327,26 +332,21 @@ def train(args, train_set, val_set):
                 scene_attribute=scene_attribute,
                 images=images,
                 optical=optical,
+                intent_feature=intent_feature,
                 average=False
             )
 
             # 计算速度预测损失（除以100进行归一化）
             speed_loss = mse(speed_preds, future_speed) / 100
 
-            # 计算穿越状态预测损失（多帧BCE损失的平均）
-            crossing_loss = 0
-            for i in range(future_cross.shape[1]):
-                crossing_loss += bce(crossing_preds[:,i], future_cross[:,i])
-            crossing_loss /= future_cross.shape[1]  # 按帧数平均
-            
-            # 总损失 = 速度损失 + 穿越损失 + 模型内部损失
-            loss = speed_loss + crossing_loss + mloss
+            # 总损失 = 速度损失 + 模型内部损失（去掉意图/穿越任务）
+            loss = speed_loss + mloss
             loss.backward()  # 反向传播
             optimizer.step() # 更新参数
             
             # 累加损失值
             avg_epoch_train_s_loss += float(speed_loss)
-            avg_epoch_train_c_loss += float(crossing_loss)
+            avg_epoch_train_c_loss += 0.0
             avg_epoch_train_t_loss += float(loss)
             torch.cuda.synchronize()  # 等待GPU操作完成
 
@@ -401,17 +401,16 @@ def train(args, train_set, val_set):
             future_speed = val_in['future_speed'].cuda(non_blocking=True) # 未来速度序列
             pos = val_in['pos'].cuda(non_blocking=True)                  # 历史位置序列
             future_pos = val_in['future_pos'].cuda(non_blocking=True)    # 未来位置序列
-            future_cross = val_in['future_cross'].cuda(non_blocking=True)# 未来穿越状态
             ped_attribute = val_in['ped_attribute'].cuda(non_blocking=True)
             scene_attribute = val_in['scene_attribute'].cuda(non_blocking=True)
             optical = val_in['optical'].cuda(non_blocking=True)          # 光流特征
             ped_behavior = val_in['ped_behavior'].cuda(non_blocking=True)# 行人行为特征
             images = val_in['image'].cuda(non_blocking=True)             # 图像特征
-            label_c = val_in['cross_label'].cuda(non_blocking=True)      # 穿越意图标签
+            intent_feature = _maybe_intent_feature(val_in)               # VLM提取的意图辅助特征（可选）
             
             with torch.no_grad():
                 # 前向传播：average=True 表示验证模式，计算意图概率
-                vloss, speed_preds, crossing_preds, intentions = net(
+                vloss, speed_preds = net(
                     speed=speed, 
                     pos=pos,
                     ped_attribute=ped_attribute,
@@ -419,16 +418,14 @@ def train(args, train_set, val_set):
                     scene_attribute=scene_attribute,
                     images=images,
                     optical=optical,
+                    intent_feature=intent_feature,
                     average=True
                 )
                 
                 # 计算验证损失
                 speed_loss_v = mse(speed_preds, future_speed) / 100
                 
-                crossing_loss_v = 0
-                for i in range(future_cross.shape[1]):
-                    crossing_loss_v += bce(crossing_preds[:,i], future_cross[:,i])
-                crossing_loss_v /= future_cross.shape[1]
+                crossing_loss_v = 0.0
                 
                 # 累加验证损失
                 avg_epoch_val_s_loss += float(speed_loss_v)
@@ -443,27 +440,6 @@ def train(args, train_set, val_set):
                 aiou += float(utils.AIOU(preds_p, future_pos)) # 平均IoU
                 fiou += float(utils.FIOU(preds_p, future_pos)) # 最终IoU
                 
-                # 处理穿越状态预测结果
-                # future_cross[:,:,1]：取穿越状态的正类概率（是否穿越）
-                future_cross_np = future_cross[:,:,1].view(-1).cpu().numpy()
-                # 对穿越状态预测取argmax得到二分类结果
-                crossing_preds_np = np.argmax(crossing_preds.view(-1,2).detach().cpu().numpy(), axis=1)
-                # 计算分类指标
-                precision, recall, f1, accuracy = calculate_score(crossing_preds_np, future_cross_np)
-                pre.append(precision)
-                recall_sc.append(recall)
-                f1_sc.append(f1)
-                acc.append(accuracy)
-                
-                # 处理意图预测结果
-                label_c_np = label_c.view(-1).cpu().numpy()
-                intentions_np = intentions.view(-1).detach().cpu().numpy()
-
-                # 收集所有预测结果用于后续计算总体指标
-                state_preds.extend(crossing_preds_np)
-                state_targets.extend(future_cross_np)
-                intent_preds.extend(intentions_np)
-                intent_targets.extend(label_c_np)
                 torch.cuda.synchronize()
 
             
@@ -485,23 +461,8 @@ def train(args, train_set, val_set):
         writer.add_scalar("Loss_crossing/val", avg_epoch_val_c_loss, epoch)
 
 
-        # 计算意图分类指标（所有样本的平均值）
-        pre_int, recall_int, f1_intt, acc_int = calculate_score(np.array(intent_preds), np.array(intent_targets))
-        # 计算穿越状态分类指标（按批次平均）
-        pre = np.sum(pre) / counter
-        recall_sc = np.sum(recall_sc) / counter
-        f1_sc = np.sum(f1_sc) / counter
-        acc = np.sum(acc) / counter
-
-        # 使用sklearn计算总体指标
-        avg_acc = accuracy_score(state_targets, state_preds)          # 状态分类准确率
-        f1_state = f1_score(state_targets, state_preds)               # 状态分类F1
-        avg_rec = recall_score(state_targets, state_preds, average='binary', zero_division=1)  # 状态分类召回率
-        avg_pre = precision_score(state_targets, state_preds, average='binary', zero_division=1)  # 状态分类精确率
-        mAP = average_precision_score(state_targets, state_preds, average=None)  # 状态分类mAP
-        intent_acc = accuracy_score(intent_targets, intent_preds)    # 意图分类准确率
-        f1_int = f1_score(intent_targets, intent_preds)              # 意图分类F1
-        intent_mAP = average_precision_score(intent_targets, intent_preds, average=None)  # 意图分类mAP
+        # 去掉意图/穿越任务后，不再计算分类指标。
+        intent_acc = 0.0
         
         # 保存本轮训练数据（用于后续分析和可视化）
         data.append([epoch, avg_epoch_train_s_loss, avg_epoch_val_s_loss, \
@@ -537,10 +498,7 @@ def train(args, train_set, val_set):
         # 打印本轮训练结果
         print('e:', epoch, 
              '| ade: %.4f'% ade, 
-            '| fde: %.4f'% fde, '| aiou: %.4f'% aiou, '| fiou: %.4f'% fiou, '| state_acc: %.4f'% avg_acc, acc, 
-            '| intention_acc: %.4f'% intent_acc, acc_int, '| f1_int: %.4f'% f1_int, f1_intt, 
-            '| f1_state: %.4f'% f1_state, f1_sc, '| pre: %.4f'% pre, '| recall_sc: %.4f'% recall_sc,
-            '| pre_int: %.4f'% pre_int, '| recall_int: %.4f'% recall_int)
+            '| fde: %.4f'% fde, '| aiou: %.4f'% aiou, '| fiou: %.4f'% fiou)
    
 
     # 将训练数据转换为DataFrame（便于后续分析和可视化）
