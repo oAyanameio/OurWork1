@@ -26,28 +26,6 @@ from model.cofe import CoFE
 
 
 class PTINet(nn.Module):
-    """
-    PTINet主模型类
-    
-    架构概述:
-    1. 多模态编码器模块：对位置、速度、行为、场景、图像、光流分别进行编码
-    2. 特征融合模块：将各模态特征融合为统一的隐藏状态
-    3. 双任务解码器：分别预测速度轨迹和穿越意图
-    
-    Args:
-        args: 配置参数对象，包含以下关键参数：
-            - dataset: 数据集名称 ('jaad', 'pie', 'titan')
-            - hidden_size: 隐藏层维度
-            - device: 计算设备 ('cuda' 或 'cpu')
-            - use_attribute: 是否使用属性特征
-            - use_image: 是否使用图像特征
-            - image_network: 图像网络类型 ('clstm', 'resnet50', 'resnet18')
-            - use_opticalflow: 是否使用光流特征
-            - output: 输出时间步数
-            - skip: 采样间隔
-            - hardtanh_limit: Hardtanh激活函数的限制范围
-    """
-    
     def __init__(self, args):
         super(PTINet, self).__init__()
 
@@ -177,6 +155,8 @@ class PTINet(nn.Module):
                 input_size=self.size,
                 hidden_size=args.cofe_hidden_size,
                 num_layers=args.cofe_num_layers,
+                use_intent=(self.intent_feature_dim > 0),
+                intent_dim=self.intent_feature_dim or 512,
             )
             if args.dataset == 'T2FPV':
                 cofe_kwargs.update(dict(
@@ -205,19 +185,11 @@ class PTINet(nn.Module):
             max_val=args.hardtanh_limit
         )
         self.softmax = nn.Softmax(dim=1)
-        # CoFE 联合训练开关：默认不额外加入 CoFE 监督损失，
-        # 当 T2FPV 数据提供干净历史轨迹 hist_abs_gt 时可通过配置设为正数。
         self.cofe_loss_weight = getattr(args, 'cofe_loss_weight', 0.0)
         
         self.args = args
 
     def _make_hist_all_from_pos(self, pos, hist_yaw=None):
-        """将 PTINet 原有 batch-first pos 输入补成 T2FPV/CoFE 所需的 hist_all。
-
-        T2FPV/CoFE 至少需要 [x, y, yaw]，但旧训练脚本通常只传 pos。
-        为了先保证模型层能无缝衔接，这里在缺少 yaw 时补 0，后续如数据集
-        提供真实机器人朝向，可通过 hist_yaw 传入覆盖该兜底值。
-        """
         if pos is None:
             return None
         if hist_yaw is None:
@@ -225,27 +197,16 @@ class PTINet(nn.Module):
         return torch.cat([pos, hist_yaw.unsqueeze(-1)], dim=-1)
 
     def _normalize_fpv_inputs(self, hist_all, hist_resnet=None, hist_seq_start_end=None):
-        """统一第一视角输入布局，输出 CoFE 使用的 sequence-first 格式。
-
-        支持三类常见来源：
-        1. CoFE/T2FPV 原始格式 (T, N, F)；
-        2. PyTorch DataLoader 常见格式 (B, T, F)；
-        3. 按场景组织的 batch 格式 (B, T, N, F) 或 (T, B, N, F)。
-        同时自动构造 seq_start_end，保证 ego 相对距离和 yaw 编码能按场景计算。
-        """
         if hist_all is None:
             raise ValueError("T2FPV forward requires `hist_all` or batch-first `pos`.")
-
         input_len = getattr(self.args, 'input', None)
         if hist_all.dim() == 4:
             if input_len is not None and hist_all.shape[0] == input_len:
-                # 已是 sequence-first 的场景 batch：(T, B, N, F)，只需压平 B*N。
                 T, B, N, F = hist_all.shape
                 hist_all = hist_all.reshape(T, B * N, F)
                 if hist_resnet is not None:
                     hist_resnet = hist_resnet.reshape(T, B * N, hist_resnet.shape[-1])
             else:
-                # DataLoader 常见 batch-first 场景张量：(B, T, N, F)，先换到时间维在前。
                 B, T, N, F = hist_all.shape
                 hist_all = hist_all.permute(1, 0, 2, 3).contiguous().reshape(T, B * N, F)
                 if hist_resnet is not None:
@@ -258,15 +219,12 @@ class PTINet(nn.Module):
                 )
         elif hist_all.dim() == 3:
             if input_len is not None and hist_all.shape[1] == input_len and hist_all.shape[0] != input_len:
-                # 单 agent/已展平 agent 的 batch-first 输入：(B, T, F)。
                 hist_all = hist_all.permute(1, 0, 2).contiguous()
                 if hist_resnet is not None:
                     hist_resnet = hist_resnet.permute(1, 0, 2).contiguous()
             elif input_len is not None and hist_all.shape[0] == input_len:
-                # CoFE 原始 sequence-first 输入：(T, N, F)。
                 hist_all = hist_all.contiguous()
             else:
-                # 无法仅凭维度判断时保留旧调用约定，避免破坏已有 sequence-first 测试。
                 hist_all = hist_all.contiguous()
             if hist_seq_start_end is None:
                 hist_seq_start_end = torch.tensor([[0, hist_all.shape[1]]], device=hist_all.device, dtype=torch.long)
@@ -274,7 +232,6 @@ class PTINet(nn.Module):
             raise ValueError(f"T2FPV hist_all must be 3D or 4D, got shape {tuple(hist_all.shape)}")
 
         if hist_all.shape[-1] < 3:
-            # T2FPV 的 CoFE 特征包含 yaw；若机器人数据暂时没有朝向，先用 0 度兜底。
             yaw = torch.zeros(*hist_all.shape[:-1], device=hist_all.device, dtype=hist_all.dtype)
             hist_all = torch.cat([hist_all, yaw.unsqueeze(-1)], dim=-1)
 
@@ -283,8 +240,6 @@ class PTINet(nn.Module):
     def forward(self, speed=None, pos=None, ped_attribute=None, 
                 ped_behavior=None, scene_attribute=None, images=None, optical=None, average=False, hist_all=None, hist_resnet=None, hist_seq_start_end=None, hist_yaw=None, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None):
         if self.args.dataset == 'T2FPV':
-            # T2FPV/机器人第一视角走专用 FPV 分支：优先使用完整 hist_all，
-            # 否则兼容旧 PTINet 数据管线中的 pos 输入。
             if hist_all is None:
                 hist_all = self._make_hist_all_from_pos(pos, hist_yaw)
             return self.forward_fpv(
@@ -297,17 +252,37 @@ class PTINet(nn.Module):
                 intent_feature=intent_feature,
             )
 
+        cofe_loss = torch.zeros(1, device=self.args.device)
         if self.args.use_cofe and pos is not None:
             pos_seq_first = pos.permute(1, 0, 2)
+            if self.training:
+                if hist_abs_gt is not None:
+                    gt_seq_first = hist_abs_gt.permute(1, 0, 2) if hist_abs_gt.dim() == 3 and hist_abs_gt.shape[1] == pos_seq_first.shape[0] else hist_abs_gt
+                    gt_abs = gt_seq_first[..., :2]
+                    gt_yaw = hist_yaw_gt if hist_yaw_gt is not None else None
+                else:
+                    gt_abs = pos_seq_first
+                    gt_yaw = None
+                cofe_loss = self.cofe.train_correction(
+                    hist_abs_gt=gt_abs,
+                    hist_yaw_gt=gt_yaw,
+                    hist_abs_pred=pos_seq_first,
+                    hist_yaw_pred=None,
+                    hist_resnet=None,
+                    hist_seq_start_end=None,
+                    hist_intent=intent_feature,
+                )
             corrected_pos_seq_first = self.cofe.infer_correction(
                 pos_seq_first,
                 hist_yaw_pred=None,
                 hist_resnet=None,
                 hist_seq_start_end=None,
+                hist_intent=intent_feature,
             )
             pos = corrected_pos_seq_first.permute(1, 0, 2)
             new_speed = torch.zeros_like(pos)
             new_speed[:, 1:, :] = pos[:, 1:, :] - pos[:, :-1, :]
+            new_speed[:, 0, :] = new_speed[:, 1, :]
             speed = new_speed
 
         pbloss = torch.zeros(1, device=self.args.device)
@@ -361,18 +336,18 @@ class PTINet(nn.Module):
 
         if self.args.use_opticalflow:
             batch_size_op, seq_len_op, c_op, h_op, w_op = optical.size()
-            optical = optical.view(batch_size * seq_len_op, c_op, h_op, w_op)
+            optical = optical.view(batch_size_op * seq_len_op, c_op, h_op, w_op)
             op_feats = self.resnet(optical)
-            op_feats = op_feats.view(batch_size, seq_len_op, -1)
+            op_feats = op_feats.view(batch_size_op, seq_len_op, -1)
             _, (himg_op, cimg_op) = self.op_encoder(op_feats)
             himg_op = himg_op[-1, :, :].squeeze(0)
             cimg_op = cimg_op[-1, :, :].squeeze(0)
 
         outputs = []
         if self.args.dataset == 'jaad' or self.args.dataset == 'pie':   
-            outputs.append(ploss + sloss + pbloss + psloss)
+            outputs.append(ploss + sloss + pbloss + psloss + cofe_loss)
         else:
-            outputs.append(ploss + sloss + pbloss)
+            outputs.append(ploss + sloss + pbloss + cofe_loss)
 
         speed_outputs = torch.tensor([], device=self.args.device)
         in_sp = speed[:, -1, :]
@@ -410,7 +385,6 @@ class PTINet(nn.Module):
         return tuple(outputs)
 
     def forward_fpv(self, hist_all, hist_resnet=None, hist_seq_start_end=None, average=False, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None):
-        # 所有 FPV 输入先规范为 (T, N, F)，避免 CoFE 和 PTINet 编码器理解的维度不一致。
         hist_all, hist_resnet, hist_seq_start_end = self._normalize_fpv_inputs(
             hist_all, hist_resnet, hist_seq_start_end
         )
@@ -420,32 +394,43 @@ class PTINet(nn.Module):
         hist_abs = hist_all[..., :2]
         hist_yaw = hist_all[..., 2]
 
-        # CoFE 先修正历史轨迹，PTINet 再基于修正后位置重算速度并做多任务预测。
         cofe_loss = torch.zeros(1, device=device)
         if self.args.use_cofe:
-            corrected = self.cofe.infer_correction(
-                hist_abs, hist_yaw, hist_resnet, hist_seq_start_end
-            )
-            if hist_abs_gt is not None and self.cofe_loss_weight > 0:
-                # 如果数据集中同时有噪声轨迹和干净轨迹，这里把 CoFE 修正误差纳入总 loss，
-                # 使 CoFE 参数和 PTINet 下游预测损失在同一次反传中共同优化。
-                hist_abs_gt, _, _ = self._normalize_fpv_inputs(hist_abs_gt, None, hist_seq_start_end)
-                hist_abs_gt = hist_abs_gt[..., :2]
-                if hist_yaw_gt is None:
-                    hist_yaw_gt = hist_yaw
-                elif hist_yaw_gt.dim() == 2 and hist_yaw_gt.shape[0] != T and hist_yaw_gt.shape[1] == T:
-                    hist_yaw_gt = hist_yaw_gt.permute(1, 0).contiguous()
+            if self.training:
+                if hist_abs_gt is not None:
+                    gt_all, _, _ = self._normalize_fpv_inputs(hist_abs_gt, None, hist_seq_start_end)
+                    gt_abs = gt_all[..., :2]
+                    if hist_yaw_gt is None:
+                        gt_yaw = hist_yaw
+                    elif hist_yaw_gt.dim() == 2 and hist_yaw_gt.shape[0] != T and hist_yaw_gt.shape[1] == T:
+                        gt_yaw = hist_yaw_gt.permute(1, 0).contiguous()
+                    else:
+                        gt_yaw = hist_yaw_gt
+                else:
+                    gt_abs = hist_abs
+                    gt_yaw = hist_yaw
                 cofe_loss = self.cofe.train_correction(
-                    hist_abs_gt, hist_yaw_gt, hist_abs, hist_yaw, hist_resnet, hist_seq_start_end
-                ) * self.cofe_loss_weight
+                    hist_abs_gt=gt_abs,
+                    hist_yaw_gt=gt_yaw,
+                    hist_abs_pred=hist_abs,
+                    hist_yaw_pred=hist_yaw,
+                    hist_resnet=hist_resnet,
+                    hist_seq_start_end=hist_seq_start_end,
+                    hist_intent=intent_feature,
+                )
+            corrected = self.cofe.infer_correction(
+                hist_abs, hist_yaw, hist_resnet, hist_seq_start_end,
+                hist_intent=intent_feature,
+            )
         else:
             corrected = hist_abs
+            cofe_loss = 0.0
 
         pos = corrected.permute(1, 0, 2).contiguous()
 
-        # 物理一致性：CoFE 修正位置后，速度必须由修正后位置一阶差分重新计算。
         speed = torch.zeros_like(pos)
         speed[:, 1:] = pos[:, 1:] - pos[:, :-1]
+        speed[:, 0] = speed[:, 1]
 
         sloss, _, zsp, hsp, _ = self.speed_encoder(speed)
         hsp = hsp[0].squeeze(0)
@@ -478,7 +463,6 @@ class PTINet(nn.Module):
         hop = torch.zeros(batch, hidden_size, device=device)
         cop = torch.zeros(batch, hidden_size, device=device)
 
-        # 第一个返回值保留 PTINet 的 VAE 内部损失，并可叠加 CoFE 监督损失。
         outputs = [ploss + sloss + pbloss + psloss + cofe_loss]
 
         speed_outputs = torch.tensor([], device=device)
