@@ -151,12 +151,14 @@ class PTINet(nn.Module):
             )
 
         if args.use_cofe:
+            intent_dim = getattr(args, 'intent_feature_dim', 0)
+            use_intent = intent_dim > 0
             cofe_kwargs = dict(
                 input_size=self.size,
                 hidden_size=args.cofe_hidden_size,
                 num_layers=args.cofe_num_layers,
-                use_intent=(self.intent_feature_dim > 0),
-                intent_dim=self.intent_feature_dim or 512,
+                use_intent=use_intent,
+                intent_dim=intent_dim,
             )
             if args.dataset == 'T2FPV':
                 cofe_kwargs.update(dict(
@@ -237,8 +239,8 @@ class PTINet(nn.Module):
 
         return hist_all, hist_resnet, hist_seq_start_end
         
-    def forward(self, speed=None, pos=None, ped_attribute=None, 
-                ped_behavior=None, scene_attribute=None, images=None, optical=None, average=False, hist_all=None, hist_resnet=None, hist_seq_start_end=None, hist_yaw=None, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None):
+    def forward(self, speed=None, pos=None, ped_attribute=None,
+                ped_behavior=None, scene_attribute=None, images=None, optical=None, average=False, hist_all=None, hist_resnet=None, hist_seq_start_end=None, hist_yaw=None, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None, ego_idx=None):
         if self.args.dataset == 'T2FPV':
             if hist_all is None:
                 hist_all = self._make_hist_all_from_pos(pos, hist_yaw)
@@ -250,6 +252,7 @@ class PTINet(nn.Module):
                 hist_abs_gt=hist_abs_gt,
                 hist_yaw_gt=hist_yaw_gt,
                 intent_feature=intent_feature,
+                ego_idx=ego_idx,
             )
 
         cofe_loss = torch.zeros(1, device=self.args.device)
@@ -345,9 +348,10 @@ class PTINet(nn.Module):
 
         outputs = []
         if self.args.dataset == 'jaad' or self.args.dataset == 'pie':   
-            outputs.append(ploss + sloss + pbloss + psloss + cofe_loss)
+            outputs.append(ploss + sloss + pbloss + psloss + self.cofe_loss_weight * cofe_loss)
         else:
-            outputs.append(ploss + sloss + pbloss + cofe_loss)
+            outputs.append(ploss + sloss + pbloss + self.cofe_loss_weight * cofe_loss)
+        outputs.append(cofe_loss)
 
         speed_outputs = torch.tensor([], device=self.args.device)
         in_sp = speed[:, -1, :]
@@ -384,12 +388,26 @@ class PTINet(nn.Module):
 
         return tuple(outputs)
 
-    def forward_fpv(self, hist_all, hist_resnet=None, hist_seq_start_end=None, average=False, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None):
+    def forward_fpv(self, hist_all, hist_resnet=None, hist_seq_start_end=None, average=False, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None, ego_idx=None):
         hist_all, hist_resnet, hist_seq_start_end = self._normalize_fpv_inputs(
             hist_all, hist_resnet, hist_seq_start_end
         )
         T, N, _ = hist_all.shape
         device = hist_all.device
+
+        if intent_feature is not None and self.intent_feature_dim > 0:
+            assert intent_feature.shape[-1] == self.intent_feature_dim, \
+                f"intent_feature last dim {intent_feature.shape[-1]} != intent_feature_dim {self.intent_feature_dim}"
+            if intent_feature.dim() == 3:
+                B, Na, D = intent_feature.shape
+                assert B * Na == N, \
+                    f"intent_feature [{B}, {Na}, {D}] flatten mismatch: B*Na={B*Na} != N={N}"
+                intent_feature = intent_feature.reshape(N, D)
+            elif intent_feature.dim() == 4:
+                Ti, B, Na, D = intent_feature.shape
+                assert B * Na == N, \
+                    f"intent_feature [{Ti}, {B}, {Na}, {D}] flatten mismatch: B*Na={B*Na} != N={N}"
+                intent_feature = intent_feature.reshape(Ti, N, D)
 
         hist_abs = hist_all[..., :2]
         hist_yaw = hist_all[..., 2]
@@ -402,6 +420,8 @@ class PTINet(nn.Module):
                     gt_abs = gt_all[..., :2]
                     if hist_yaw_gt is None:
                         gt_yaw = hist_yaw
+                    elif hist_yaw_gt.dim() == 3:
+                        gt_yaw = hist_yaw_gt.permute(1, 0, 2).contiguous().reshape(T, -1)
                     elif hist_yaw_gt.dim() == 2 and hist_yaw_gt.shape[0] != T and hist_yaw_gt.shape[1] == T:
                         gt_yaw = hist_yaw_gt.permute(1, 0).contiguous()
                     else:
@@ -424,7 +444,7 @@ class PTINet(nn.Module):
             )
         else:
             corrected = hist_abs
-            cofe_loss = 0.0
+            cofe_loss = torch.zeros(1, device=device)
 
         pos = corrected.permute(1, 0, 2).contiguous()
 
@@ -463,7 +483,7 @@ class PTINet(nn.Module):
         hop = torch.zeros(batch, hidden_size, device=device)
         cop = torch.zeros(batch, hidden_size, device=device)
 
-        outputs = [ploss + sloss + pbloss + psloss + cofe_loss]
+        outputs = [ploss + sloss + pbloss + psloss + self.cofe_loss_weight * cofe_loss, cofe_loss]
 
         speed_outputs = torch.tensor([], device=device)
         in_sp = speed[:, -1, :]
@@ -472,8 +492,10 @@ class PTINet(nn.Module):
         zds = zpo + zsp + zpa + zsa + pb + cim + cop
         if self.intent_proj is not None and intent_feature is not None:
             if intent_feature.dim() == 3:
-                intent_feature = intent_feature.mean(dim=1)
-            intent_emb = self.intent_proj(intent_feature)
+                intent_prior = intent_feature.mean(dim=0)
+            else:
+                intent_prior = intent_feature
+            intent_emb = self.intent_proj(intent_prior)
             hds = hds + intent_emb
             zds = zds + intent_emb
 
@@ -483,6 +505,10 @@ class PTINet(nn.Module):
             speed_outputs = torch.cat((speed_outputs, speed_output.unsqueeze(1)), dim=1)
             in_sp = speed_output.detach()
 
-        outputs.append(speed_outputs)
+        if ego_idx is not None:
+            ego_speed_preds = speed_outputs[ego_idx]
+        else:
+            ego_speed_preds = speed_outputs
+        outputs.append(ego_speed_preds)
 
         return tuple(outputs)

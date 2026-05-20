@@ -44,7 +44,6 @@ class CoFE(nn.Module):
     
     支持两种模式：
     1. FPV（第一人称视角）模式：使用完整的特征空间
-    2. BEV（鸜瞰视角）模式：仅使用相对位移进行修正
     """
 
     def __init__(self, input_size=2, hidden_size=96, num_layers=2,
@@ -58,6 +57,7 @@ class CoFE(nn.Module):
         self.no_abs = no_abs
         self.use_resnet = use_resnet
         self.use_intent = use_intent
+        self.intent_dim = intent_dim
         self.idxs = idxs if idxs is not None else [6, 7]
         self.offset_idxs = torch.tensor(self.idxs, dtype=torch.long)
         self.feat_dim = len(self.idxs)
@@ -154,7 +154,7 @@ class CoFE(nn.Module):
         if self.f_intent is None:
             return torch.empty((num_agents, 0), device=device)
         if hist_intent is None:
-            hist_intent_t = torch.zeros(num_agents, self.hidden_size, device=device)
+            hist_intent_t = torch.zeros(num_agents, self.intent_dim, device=device)
         elif hist_intent.dim() == 2:
             hist_intent_t = hist_intent
         else:

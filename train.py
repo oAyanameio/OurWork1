@@ -117,14 +117,16 @@ def train(args, train_set, val_set):
     if args.lr_scheduler:
         scheduler = optim.lr_scheduler.StepLR(optimizer, 30, 0.5)
     
-    train_sampler = DistributedSampler(train_set)     
+    train_sampler = DistributedSampler(train_set)
+    train_collate = getattr(train_set, 'collate_fn', None)
     dataloader_train = torch.utils.data.DataLoader(
         train_set, 
         batch_size=args.batch_size,
         pin_memory=args.pin_memory, 
         num_workers=0,
         drop_last=True,
-        sampler=train_sampler
+        sampler=train_sampler,
+        collate_fn=train_collate,
     )
     mse = nn.MSELoss()
     bce = nn.BCELoss()
@@ -178,8 +180,17 @@ def train(args, train_set, val_set):
             hist_resnet = inputs.get('hist_resnet', None)
             if hist_resnet is not None: hist_resnet = hist_resnet.cuda(non_blocking=True)
 
+            ego_idx = inputs.get('ego_idx', None)
+            if ego_idx is not None: ego_idx = ego_idx.cuda(non_blocking=True)
+
+            hist_abs_gt = inputs.get('hist_all', None)
+            if hist_abs_gt is not None: hist_abs_gt = hist_abs_gt.cuda(non_blocking=True)
+
+            hist_yaw_gt = inputs.get('hist_yaw', None)
+            if hist_yaw_gt is not None: hist_yaw_gt = hist_yaw_gt.cuda(non_blocking=True)
+
             net.zero_grad()
-            mloss, speed_preds = net(
+            mloss, cofe_loss_val, speed_preds = net(
                 speed=speed,
                 pos=pos,
                 ped_attribute=ped_attribute,
@@ -192,13 +203,16 @@ def train(args, train_set, val_set):
                 hist_all=hist_all,
                 hist_seq_start_end=hist_seq_start_end,
                 hist_resnet=hist_resnet,
+                ego_idx=ego_idx,
+                hist_abs_gt=hist_abs_gt,
+                hist_yaw_gt=hist_yaw_gt,
             )
             speed_loss = mse(speed_preds, future_speed) / 100
             loss = speed_loss + mloss
             loss.backward()
             optimizer.step()
             avg_epoch_train_s_loss += float(speed_loss)
-            avg_epoch_train_c_loss += 0.0
+            avg_epoch_train_c_loss += float(cofe_loss_val)
             avg_epoch_train_t_loss += float(loss)
             torch.cuda.synchronize()
 
@@ -206,17 +220,19 @@ def train(args, train_set, val_set):
         avg_epoch_train_c_loss /= counter
         avg_epoch_train_t_loss /= counter
         writer.add_scalar("Loss_speed/train", avg_epoch_train_s_loss, epoch)
-        writer.add_scalar("Loss_crossing/train", avg_epoch_train_c_loss, epoch)
+        writer.add_scalar("Loss_cofe/train", avg_epoch_train_c_loss, epoch)
         writer.add_scalar("Loss/train", avg_epoch_train_t_loss, epoch)
 
-        val_sampler = DistributedSampler(val_set)     
+        val_sampler = DistributedSampler(val_set)
+        val_collate = getattr(val_set, 'collate_fn', None)
         dataloader_val = torch.utils.data.DataLoader(
             val_set, 
             batch_size=args.batch_size,
             pin_memory=args.pin_memory, 
             num_workers=0, 
             drop_last=True,
-            sampler=val_sampler
+            sampler=val_sampler,
+            collate_fn=val_collate,
         )
         counter = 0
         state_preds = []
@@ -250,8 +266,17 @@ def train(args, train_set, val_set):
             hist_resnet = val_in.get('hist_resnet', None)
             if hist_resnet is not None: hist_resnet = hist_resnet.cuda(non_blocking=True)
 
+            ego_idx = val_in.get('ego_idx', None)
+            if ego_idx is not None: ego_idx = ego_idx.cuda(non_blocking=True)
+
+            hist_abs_gt = val_in.get('hist_all', None)
+            if hist_abs_gt is not None: hist_abs_gt = hist_abs_gt.cuda(non_blocking=True)
+
+            hist_yaw_gt = val_in.get('hist_yaw', None)
+            if hist_yaw_gt is not None: hist_yaw_gt = hist_yaw_gt.cuda(non_blocking=True)
+
             with torch.no_grad():
-                vloss, speed_preds = net(
+                vloss, _, speed_preds = net(
                     speed=speed, 
                     pos=pos,
                     ped_attribute=ped_attribute,
@@ -264,6 +289,9 @@ def train(args, train_set, val_set):
                     hist_all=hist_all,
                     hist_seq_start_end=hist_seq_start_end,
                     hist_resnet=hist_resnet,
+                    ego_idx=ego_idx,
+                    hist_abs_gt=hist_abs_gt,
+                    hist_yaw_gt=hist_yaw_gt,
                 )
                 speed_loss_v = mse(speed_preds, future_speed) / 100
                 crossing_loss_v = 0.0
@@ -289,7 +317,7 @@ def train(args, train_set, val_set):
         intent_acc = 0.0
         data.append([epoch, avg_epoch_train_s_loss, avg_epoch_val_s_loss, \
                     avg_epoch_train_c_loss, avg_epoch_val_c_loss, \
-                    ade, fde, aiou, fiou, intention_acc])
+                    ade, fde, aiou, fiou, intent_acc])
         if args.lr_scheduler:
             scheduler.step(avg_epoch_train_t_loss)
         if ade < best_ade:
@@ -302,7 +330,8 @@ def train(args, train_set, val_set):
             torch.save(net.state_dict(), os.path.join(args.out_dir, args.log_name, modelname))
         print('e:', epoch, 
              '| ade: %.4f'% ade, 
-            '| fde: %.4f'% fde, '| aiou: %.4f'% aiou, '| fiou: %.4f'% fiou)
+            '| fde: %.4f'% fde, '| aiou: %.4f'% aiou, '| fiou: %.4f'% fiou,
+            '| cofe: %.6f'% avg_epoch_train_c_loss)
    
     df = pd.DataFrame(data, columns=['epoch', 'train_loss_s', 'val_loss_s', 'train_loss_c', 'val_loss_c',
                                      'ade', 'fde', 'aiou', 'fiou', 'intention_acc']) 
@@ -325,7 +354,7 @@ def train(args, train_set, val_set):
 if __name__ == '__main__':
     print("Date and time:", datetime.datetime.now())
     args = parse_args()
-    config = parse_config_file('/home/lbh/PTINet/config.yml')
+    config = parse_config_file('/home/lbh/OurWork1/config.yml')
     if config.get('use_argument_parser') == False:
         for arg in vars(args):
             if arg in config:
@@ -343,7 +372,7 @@ if __name__ == '__main__':
                 save=args.save,
                 use_images=args.use_image,
                 use_attribute=args.use_attribute,
-                use_opticalflow=args.use.opticalflow
+                use_opticalflow=args.use_opticalflow
                 )
     val_set = eval('datasets.' + args.dataset)(
                 data_dir=args.data_dir,
@@ -357,7 +386,7 @@ if __name__ == '__main__':
                 save=args.save,
                 use_images=args.use_image,
                 use_attribute=args.use_attribute,
-                use_opticalflow=args.use.opticalflow
+                use_opticalflow=args.use_opticalflow
                 )
     train(args, train_set, val_set)
     
