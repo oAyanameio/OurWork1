@@ -189,7 +189,7 @@ class PTINet(nn.Module):
         self.softmax = nn.Softmax(dim=1)
         self.cofe_loss_weight = getattr(args, 'cofe_loss_weight', 0.0)
         
-        self.args = args
+        self.args = args  # 保存模型配置参数，包括数据集选择、隐藏层大小、设备信息等全局配置
 
     def _make_hist_all_from_pos(self, pos, hist_yaw=None):
         if pos is None:
@@ -239,8 +239,23 @@ class PTINet(nn.Module):
 
         return hist_all, hist_resnet, hist_seq_start_end
         
-    def forward(self, speed=None, pos=None, ped_attribute=None,
-                ped_behavior=None, scene_attribute=None, images=None, optical=None, average=False, hist_all=None, hist_resnet=None, hist_seq_start_end=None, hist_yaw=None, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None, ego_idx=None):
+    def forward(self, 
+                speed=None,           # 行人速度序列 [batch, seq_len, 4] - 边界框中心点速度
+                pos=None,             # 行人位置序列 [batch, seq_len, 4] - 边界框坐标(x,y,w,h)
+                ped_attribute=None,   # 行人属性特征 [batch, ped_attribute_size] - 如性别、年龄组
+                ped_behavior=None,    # 行人行为特征 [batch, seq_len, ped_behavior_size] - 如动作状态
+                scene_attribute=None, # 场景属性特征 [batch, seq_len, scene_attribute_size] - 如交通灯状态
+                images=None,          # 图像帧序列 [batch, seq_len, C, H, W]
+                optical=None,         # 光流特征序列 [batch, seq_len, C, H, W]
+                average=False,        # 是否对多模态特征进行平均融合
+                hist_all=None,        # FPV专用：所有历史轨迹数据 [seq_len, num_agents, dim]
+                hist_resnet=None,     # FPV专用：图像特征序列 [seq_len, num_agents, 2048]
+                hist_seq_start_end=None, # FPV专用：轨迹段索引 [num_trajectories, 2]
+                hist_yaw=None,        # FPV专用：历史航向角序列 [seq_len, num_agents]
+                hist_abs_gt=None,     # FPV专用：绝对位置真值 [seq_len, num_agents, dim]
+                hist_yaw_gt=None,     # FPV专用：航向角真值 [seq_len, num_agents]
+                intent_feature=None,  # 意图特征 [batch, num_agents, intent_feature_dim] - 用于意图感知预测
+                ego_idx=None):        # FPV专用：ego车辆索引
         if self.args.dataset == 'T2FPV':
             if hist_all is None:
                 hist_all = self._make_hist_all_from_pos(pos, hist_yaw)
@@ -388,7 +403,14 @@ class PTINet(nn.Module):
 
         return tuple(outputs)
 
-    def forward_fpv(self, hist_all, hist_resnet=None, hist_seq_start_end=None, average=False, hist_abs_gt=None, hist_yaw_gt=None, intent_feature=None, ego_idx=None):
+    def forward_fpv(self, hist_all, 
+                    hist_resnet=None, 
+                    hist_seq_start_end=None, 
+                    average=False, 
+                    hist_abs_gt=None, 
+                    hist_yaw_gt=None, 
+                    intent_feature=None, 
+                    ego_idx=None):
         hist_all, hist_resnet, hist_seq_start_end = self._normalize_fpv_inputs(
             hist_all, hist_resnet, hist_seq_start_end
         )
