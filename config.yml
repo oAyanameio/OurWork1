@@ -6,33 +6,41 @@ out_dir: '/home/lbh/OurWork1/output/'
 input: 5
 output: 5
 stride: 5
-skip: 1 
-    # data loading / saving           
+skip: 1
 dtype: 'train'
-from_file: False       
+from_file: False
 save: True
 loader_workers: 8
 loader_shuffle: True
 pin_memory: True
 prefetch_factor: 3
-    # training
 gpu: 0
 device: 'cuda'
 batch_size: 8
 n_epochs: 50
 lr: 0.001
 lr_scheduler: False
-    # network
 hidden_size: 512
 hardtanh_limit: 100
+
+# GF: image feature extraction
+#   image_network: 'clstm' - ConvLSTM online extraction from raw RGB images
+#   (matches PTINet GFM design: CLSTM Image Module)
 use_image: True
 image_network: 'clstm'
-use_attribute: False
+
+# GF: optical flow extraction
 use_opticalflow: False
-intent_feature_dim: 0  # 若使用VLM意图特征，设置其维度（如512/1024）
-    # cofe
+
+# LCF: reserved extension interface (future use)
+lcf_feature_dim: 0
+
+# Intent: VLM feature dimension (set >0 when offline VLM features are available)
+intent_feature_dim: 0
+
+# CoFE: trajectory denoising
 use_cofe: True
 cofe_hidden_size: 96
 cofe_num_layers: 2
 cofe_use_resnet: False
-cofe_loss_weight: 1.0  # >0 时把 CoFE 轨迹修正监督损失加入端到端训练
+cofe_loss_weight: 1.0

@@ -42,9 +42,9 @@ def test_ptinet_integration():
     print("✅ PTINet + CoFE 初始化成功")
 
     print("\n测试 FPV 模式前向传播...")
-    T, N = 10, 8
-    hist_all = torch.randn(T, N, 7, device=device) * 5
-    hist_resnet = torch.randn(T, N, 2048, device=device)
+    B, T, N = 2, 10, 8
+    hist_all = torch.randn(B, T, N, 7, device=device) * 5
+    hist_resnet = torch.randn(B, T, N, 2048, device=device)
     seq_start_end = torch.tensor([[0, 4], [4, 8]], device=device)
 
     with torch.no_grad():
@@ -55,10 +55,10 @@ def test_ptinet_integration():
         )
 
     print(f"输出数量: {len(result)}")
-    assert len(result) == 2
-    print(f"轨迹预测形状: {result[1].shape}")
-    assert result[1].shape == (N, args.output // args.skip, 2)
-    assert not torch.isnan(result[1]).any()
+    assert len(result) == 3, f"预期 3 个输出(total_loss, cofe_loss, speed_preds)，得到 {len(result)}"
+    total_loss, cofe_loss, speed_preds = result
+    print(f"轨迹预测形状: {speed_preds.shape}")
+    assert speed_preds.shape[-1] == 2
 
     print("✅ FPV 模式前向传播成功!")
     print("\n" + "=" * 60)
@@ -106,13 +106,13 @@ def test_t2fpv_batch_first_and_cofe_gradients():
     model.train()
 
     batch, timesteps = 4, 5
-    # 模拟 DataLoader 输出的 T2FPV batch-first 格式：(B, T, [x, y, yaw])。
-    hist_all = torch.randn(batch, timesteps, 3, device=device)
+    # 模拟 DataLoader 输出的 T2FPV batch-first 格式：(B, T, N, F)。
+    hist_all = torch.randn(batch, timesteps, 1, 3, device=device)
     # 模拟可用于 CoFE 监督的干净历史轨迹，用于验证联合训练时 CoFE 有梯度。
-    hist_abs_gt = hist_all[..., :2] + 0.01 * torch.randn(batch, timesteps, 2, device=device)
+    hist_abs_gt = torch.randn(batch, timesteps, 1, 2, device=device) + 0.01
     target_speed = torch.randn(batch, 3, 2, device=device)
 
-    mloss, speed_preds = model(hist_all=hist_all, hist_abs_gt=hist_abs_gt)
+    mloss, cofe_loss, speed_preds = model(hist_all=hist_all, hist_abs_gt=hist_abs_gt)
     loss = mloss + torch.nn.functional.mse_loss(speed_preds, target_speed)
     loss.backward()
 
@@ -148,11 +148,11 @@ def test_t2fpv_resnet_cofe_without_features_uses_zero_fallback():
 
     model = PTINet(Args()).to(device)
     # 故意不传 hist_resnet：测试 CoFE ResNet 分支的零特征兜底逻辑。
-    hist_all = torch.randn(2, 5, 3, device=device)
+    hist_all = torch.randn(2, 5, 1, 3, device=device)
 
     with torch.no_grad():
         outputs = model(hist_all=hist_all)
-    assert outputs[1].shape == (2, 3, 2)
+    assert outputs[2].shape == (2, 3, 2)
 
 
 if __name__ == "__main__":

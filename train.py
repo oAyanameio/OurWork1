@@ -81,8 +81,8 @@ def parse_args():
     parser.add_argument('--hardtanh_limit', type=int, default=100, help='HardTanh 激活函数边界')
     parser.add_argument('--use_image', type=bool, default=False,
                         help='使用图像作为输入特征')
-    parser.add_argument('--image_network', type=str, default='resnet50',
-                        help='选择图像主干网络（clstm/resnet50）')
+    parser.add_argument('--image_network', type=str, default='clstm',
+                        help='选择图像主干网络（clstm）')
     parser.add_argument('--use_attribute', type=bool, default=True,
                         help='使用属性作为输入特征')
     parser.add_argument('--use_opticalflow', type=bool, default=True,
@@ -151,8 +151,6 @@ def train(args, train_set, val_set):
         avg_epoch_val_v_loss   = 0
         ade  = 0
         fde  = 0
-        aiou = 0
-        fiou = 0
         avg_acc = 0
         avg_rec = 0
         avg_pre = 0
@@ -160,15 +158,26 @@ def train(args, train_set, val_set):
         counter = 0
         for idx, inputs in enumerate(dataloader_train):
             counter += 1
-            speed = inputs['speed'].cuda(non_blocking=True)
-            future_speed = inputs['future_speed'].cuda(non_blocking=True)
-            pos = inputs['pos'].cuda(non_blocking=True)
-            future_pos = inputs['future_pos'].cuda(non_blocking=True)
-            optical = inputs['optical'].cuda(non_blocking=True)
-            ped_behavior = inputs['ped_behavior'].cuda(non_blocking=True)
-            images = inputs['image'].cuda(non_blocking=True)
-            ped_attribute = inputs['ped_attribute'].cuda(non_blocking=True)
-            scene_attribute = inputs['scene_attribute'].cuda(non_blocking=True)
+            speed = inputs.get('speed')
+            if speed is not None: speed = speed.cuda(non_blocking=True)
+            future_speed = inputs.get('future_speed')
+            if future_speed is not None: future_speed = future_speed.cuda(non_blocking=True)
+            pos = inputs.get('pos')
+            if pos is not None: pos = pos.cuda(non_blocking=True)
+            future_pos = inputs.get('future_pos')
+            if future_pos is not None: future_pos = future_pos.cuda(non_blocking=True)
+            optical = inputs.get('optical')
+            if optical is not None: optical = optical.cuda(non_blocking=True)
+            ped_behavior = inputs.get('ped_behavior')
+            if ped_behavior is not None: ped_behavior = ped_behavior.cuda(non_blocking=True)
+            images = inputs.get('image')
+            if images is not None: images = images.cuda(non_blocking=True)
+            ped_attribute = inputs.get('ped_attribute')
+            if ped_attribute is not None: ped_attribute = ped_attribute.cuda(non_blocking=True)
+            scene_attribute = inputs.get('scene_attribute')
+            if scene_attribute is not None: scene_attribute = scene_attribute.cuda(non_blocking=True)
+            lcf_features = inputs.get('lcf_features')
+            if lcf_features is not None: lcf_features = lcf_features.cuda(non_blocking=True)
             intent_feature = _maybe_intent_feature(inputs)
 
             hist_all = inputs.get('hist_all', None)
@@ -183,7 +192,7 @@ def train(args, train_set, val_set):
             ego_idx = inputs.get('ego_idx', None)
             if ego_idx is not None: ego_idx = ego_idx.cuda(non_blocking=True)
 
-            hist_abs_gt = inputs.get('hist_all', None)
+            hist_abs_gt = inputs.get('hist_abs_gt', inputs.get('hist_all', None))
             if hist_abs_gt is not None: hist_abs_gt = hist_abs_gt.cuda(non_blocking=True)
 
             hist_yaw_gt = inputs.get('hist_yaw', None)
@@ -198,6 +207,7 @@ def train(args, train_set, val_set):
                 scene_attribute=scene_attribute,
                 images=images,
                 optical=optical,
+                lcf_features=lcf_features,
                 intent_feature=intent_feature,
                 average=False,
                 hist_all=hist_all,
@@ -207,7 +217,7 @@ def train(args, train_set, val_set):
                 hist_abs_gt=hist_abs_gt,
                 hist_yaw_gt=hist_yaw_gt,
             )
-            speed_loss = mse(speed_preds, future_speed) / 100
+            speed_loss = mse(speed_preds, future_speed) / 100 if future_speed is not None else torch.zeros(1, device='cuda')
             loss = speed_loss + mloss
             loss.backward()
             optimizer.step()
@@ -246,15 +256,26 @@ def train(args, train_set, val_set):
 
         for idx, val_in in enumerate(dataloader_val):
             counter += 1
-            speed = val_in['speed'].cuda(non_blocking=True)
-            future_speed = val_in['future_speed'].cuda(non_blocking=True)
-            pos = val_in['pos'].cuda(non_blocking=True)
-            future_pos = val_in['future_pos'].cuda(non_blocking=True)
-            ped_attribute = val_in['ped_attribute'].cuda(non_blocking=True)
-            scene_attribute = val_in['scene_attribute'].cuda(non_blocking=True)
-            optical = val_in['optical'].cuda(non_blocking=True)
-            ped_behavior = val_in['ped_behavior'].cuda(non_blocking=True)
-            images = val_in['image'].cuda(non_blocking=True)
+            speed = val_in.get('speed')
+            if speed is not None: speed = speed.cuda(non_blocking=True)
+            future_speed = val_in.get('future_speed')
+            if future_speed is not None: future_speed = future_speed.cuda(non_blocking=True)
+            pos = val_in.get('pos')
+            if pos is not None: pos = pos.cuda(non_blocking=True)
+            future_pos = val_in.get('future_pos')
+            if future_pos is not None: future_pos = future_pos.cuda(non_blocking=True)
+            ped_attribute = val_in.get('ped_attribute')
+            if ped_attribute is not None: ped_attribute = ped_attribute.cuda(non_blocking=True)
+            scene_attribute = val_in.get('scene_attribute')
+            if scene_attribute is not None: scene_attribute = scene_attribute.cuda(non_blocking=True)
+            optical = val_in.get('optical')
+            if optical is not None: optical = optical.cuda(non_blocking=True)
+            ped_behavior = val_in.get('ped_behavior')
+            if ped_behavior is not None: ped_behavior = ped_behavior.cuda(non_blocking=True)
+            images = val_in.get('image')
+            if images is not None: images = images.cuda(non_blocking=True)
+            lcf_features = val_in.get('lcf_features')
+            if lcf_features is not None: lcf_features = lcf_features.cuda(non_blocking=True)
             intent_feature = _maybe_intent_feature(val_in)
 
             hist_all = val_in.get('hist_all', None)
@@ -269,7 +290,7 @@ def train(args, train_set, val_set):
             ego_idx = val_in.get('ego_idx', None)
             if ego_idx is not None: ego_idx = ego_idx.cuda(non_blocking=True)
 
-            hist_abs_gt = val_in.get('hist_all', None)
+            hist_abs_gt = val_in.get('hist_abs_gt', val_in.get('hist_all', None))
             if hist_abs_gt is not None: hist_abs_gt = hist_abs_gt.cuda(non_blocking=True)
 
             hist_yaw_gt = val_in.get('hist_yaw', None)
@@ -284,6 +305,7 @@ def train(args, train_set, val_set):
                     scene_attribute=scene_attribute,
                     images=images,
                     optical=optical,
+                    lcf_features=lcf_features,
                     intent_feature=intent_feature,
                     average=True,
                     hist_all=hist_all,
@@ -293,31 +315,28 @@ def train(args, train_set, val_set):
                     hist_abs_gt=hist_abs_gt,
                     hist_yaw_gt=hist_yaw_gt,
                 )
-                speed_loss_v = mse(speed_preds, future_speed) / 100
+                speed_loss_v = mse(speed_preds, future_speed) / 100 if future_speed is not None else torch.zeros(1, device='cuda')
                 crossing_loss_v = 0.0
                 avg_epoch_val_s_loss += float(speed_loss_v)
                 avg_epoch_val_c_loss += float(crossing_loss_v)
                 avg_epoch_val_v_loss += float(vloss)
-                preds_p = utils.speed2pos(speed_preds, pos)
-                ade += float(utils.ADE(preds_p, future_pos))
-                fde += float(utils.FDE(preds_p, future_pos))
-                aiou += float(utils.AIOU(preds_p, future_pos))
-                fiou += float(utils.FIOU(preds_p, future_pos))
+                if future_pos is not None:
+                    preds_p = utils.speed2pos(speed_preds, pos)
+                    ade += float(utils.ADE(preds_p, future_pos))
+                    fde += float(utils.FDE(preds_p, future_pos))
                 torch.cuda.synchronize()
             
         avg_epoch_val_s_loss /= counter
         avg_epoch_val_c_loss /= counter
         ade  /= counter
-        fde  /= counter     
-        aiou /= counter
-        fiou /= counter
+        fde  /= counter
         v_loss = avg_epoch_val_s_loss + avg_epoch_val_c_loss + avg_epoch_val_v_loss
         writer.add_scalar("Loss_speed/val", avg_epoch_val_s_loss, epoch)
         writer.add_scalar("Loss_crossing/val", avg_epoch_val_c_loss, epoch)
         intent_acc = 0.0
-        data.append([epoch, avg_epoch_train_s_loss, avg_epoch_val_s_loss, \
-                    avg_epoch_train_c_loss, avg_epoch_val_c_loss, \
-                    ade, fde, aiou, fiou, intent_acc])
+        data.append([epoch, avg_epoch_train_s_loss, avg_epoch_val_s_loss,
+                    avg_epoch_train_c_loss, avg_epoch_val_c_loss,
+                    ade, fde, intent_acc])
         if args.lr_scheduler:
             scheduler.step(avg_epoch_train_t_loss)
         if ade < best_ade:
@@ -328,13 +347,12 @@ def train(args, train_set, val_set):
             else:
                 modelname = 'model_best' + file + '.pkl'   
             torch.save(net.state_dict(), os.path.join(args.out_dir, args.log_name, modelname))
-        print('e:', epoch, 
-             '| ade: %.4f'% ade, 
-            '| fde: %.4f'% fde, '| aiou: %.4f'% aiou, '| fiou: %.4f'% fiou,
-            '| cofe: %.6f'% avg_epoch_train_c_loss)
+        print("s_Val/s_loss = {:.2f} | c_loss = {:.2f} | v_loss = {:.2f} | ADE = {:.2f} | FDE = {:.2f} | avg_acc = {:.2f}".format(
+                    avg_epoch_val_s_loss, avg_epoch_val_c_loss, avg_epoch_val_v_loss, ade, fde, avg_acc
+                ))
    
     df = pd.DataFrame(data, columns=['epoch', 'train_loss_s', 'val_loss_s', 'train_loss_c', 'val_loss_c',
-                                     'ade', 'fde', 'aiou', 'fiou', 'intention_acc']) 
+                                                   'ade', 'fde', 'intent_acc']) 
     if args.save:
         print('\nSaving ...')
         file = '{}_{}'.format(str(args.lr), str(args.hidden_size)) 
