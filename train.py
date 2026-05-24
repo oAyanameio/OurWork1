@@ -26,10 +26,11 @@ import datasets
 
 import model.network_image as network
 import utils
-from utils import data_loader, calculate_score
+from utils import data_loader  # TODO: calculate_score 已在 utils.py 中移除，待重新实现
 from torch.utils.tensorboard import SummaryWriter
 
-import visualization.display as viz
+# TODO: 待实现可视化逻辑后取消注释
+# import visualization.display as viz
 
 def parse_config_file(file_path):
     with open(file_path, 'r') as file:
@@ -118,6 +119,7 @@ def train(args, train_set, val_set):
         scheduler = optim.lr_scheduler.StepLR(optimizer, 30, 0.5)
     
     train_sampler = DistributedSampler(train_set)
+    val_sampler = DistributedSampler(val_set)
     train_collate = getattr(train_set, 'collate_fn', None)
     dataloader_train = torch.utils.data.DataLoader(
         train_set, 
@@ -129,7 +131,6 @@ def train(args, train_set, val_set):
         collate_fn=train_collate,
     )
     mse = nn.MSELoss()
-    bce = nn.BCELoss()
     
     data = []
     best_ade = float('inf')
@@ -151,10 +152,6 @@ def train(args, train_set, val_set):
         avg_epoch_val_v_loss   = 0
         ade  = 0
         fde  = 0
-        avg_acc = 0
-        avg_rec = 0
-        avg_pre = 0
-        mAP = 0
         counter = 0
         for idx, inputs in enumerate(dataloader_train):
             counter += 1
@@ -233,7 +230,7 @@ def train(args, train_set, val_set):
         writer.add_scalar("Loss_cofe/train", avg_epoch_train_c_loss, epoch)
         writer.add_scalar("Loss/train", avg_epoch_train_t_loss, epoch)
 
-        val_sampler = DistributedSampler(val_set)
+        val_sampler.set_epoch(epoch)
         val_collate = getattr(val_set, 'collate_fn', None)
         dataloader_val = torch.utils.data.DataLoader(
             val_set, 
@@ -245,14 +242,6 @@ def train(args, train_set, val_set):
             collate_fn=val_collate,
         )
         counter = 0
-        state_preds = []
-        state_targets = []
-        intent_preds = []
-        intent_targets = []
-        f1_sc = []
-        pre = []
-        recall_sc = []
-        acc = []
 
         for idx, val_in in enumerate(dataloader_val):
             counter += 1
@@ -316,9 +305,7 @@ def train(args, train_set, val_set):
                     hist_yaw_gt=hist_yaw_gt,
                 )
                 speed_loss_v = mse(speed_preds, future_speed) / 100 if future_speed is not None else torch.zeros(1, device='cuda')
-                crossing_loss_v = 0.0
                 avg_epoch_val_s_loss += float(speed_loss_v)
-                avg_epoch_val_c_loss += float(crossing_loss_v)
                 avg_epoch_val_v_loss += float(vloss)
                 if future_pos is not None:
                     preds_p = utils.speed2pos(speed_preds, pos)
@@ -327,16 +314,13 @@ def train(args, train_set, val_set):
                 torch.cuda.synchronize()
             
         avg_epoch_val_s_loss /= counter
-        avg_epoch_val_c_loss /= counter
         ade  /= counter
         fde  /= counter
-        v_loss = avg_epoch_val_s_loss + avg_epoch_val_c_loss + avg_epoch_val_v_loss
+        v_loss = avg_epoch_val_s_loss + avg_epoch_val_v_loss
         writer.add_scalar("Loss_speed/val", avg_epoch_val_s_loss, epoch)
-        writer.add_scalar("Loss_crossing/val", avg_epoch_val_c_loss, epoch)
-        intent_acc = 0.0
         data.append([epoch, avg_epoch_train_s_loss, avg_epoch_val_s_loss,
                     avg_epoch_train_c_loss, avg_epoch_val_c_loss,
-                    ade, fde, intent_acc])
+                    ade, fde])
         if args.lr_scheduler:
             scheduler.step(avg_epoch_train_t_loss)
         if ade < best_ade:
@@ -347,12 +331,12 @@ def train(args, train_set, val_set):
             else:
                 modelname = 'model_best' + file + '.pkl'   
             torch.save(net.state_dict(), os.path.join(args.out_dir, args.log_name, modelname))
-        print("s_Val/s_loss = {:.2f} | c_loss = {:.2f} | v_loss = {:.2f} | ADE = {:.2f} | FDE = {:.2f} | avg_acc = {:.2f}".format(
-                    avg_epoch_val_s_loss, avg_epoch_val_c_loss, avg_epoch_val_v_loss, ade, fde, avg_acc
+        print("s_Val/s_loss = {:.2f} | v_loss = {:.2f} | ADE = {:.2f} | FDE = {:.2f}".format(
+                    avg_epoch_val_s_loss, avg_epoch_val_v_loss, ade, fde
                 ))
    
     df = pd.DataFrame(data, columns=['epoch', 'train_loss_s', 'val_loss_s', 'train_loss_c', 'val_loss_c',
-                                                   'ade', 'fde', 'intent_acc']) 
+                                                   'ade', 'fde']) 
     if args.save:
         print('\nSaving ...')
         file = '{}_{}'.format(str(args.lr), str(args.hidden_size)) 
@@ -372,13 +356,13 @@ def train(args, train_set, val_set):
 if __name__ == '__main__':
     print("Date and time:", datetime.datetime.now())
     args = parse_args()
-    config = parse_config_file('/home/lbh/OurWork1/config.yml')
+    config = parse_config_file(os.path.join(os.path.dirname(__file__), 'config.yml'))
     if config.get('use_argument_parser') == False:
         for arg in vars(args):
             if arg in config:
                 setattr(args, arg, config[arg])
     print(args)
-    train_set = eval('datasets.' + args.dataset)(
+    train_set = getattr(datasets, args.dataset)(
                 data_dir=args.data_dir,
                 out_dir=os.path.join(args.out_dir, args.log_name),
                 dtype='train',
@@ -392,7 +376,7 @@ if __name__ == '__main__':
                 use_attribute=args.use_attribute,
                 use_opticalflow=args.use_opticalflow
                 )
-    val_set = eval('datasets.' + args.dataset)(
+    val_set = getattr(datasets, args.dataset)(
                 data_dir=args.data_dir,
                 out_dir=os.path.join(args.out_dir, args.log_name),
                 dtype='val',

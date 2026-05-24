@@ -1,6 +1,7 @@
 import torch
 
 
+# TODO: 重构为DDP兼容版本后恢复使用（当前train.py直接使用DistributedSampler创建DataLoader）
 def data_loader(args, dataset):
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=args.loader_shuffle,

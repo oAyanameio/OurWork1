@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-from torchvision.models import ResNet50_Weights, ResNet18_Weights
+from torchvision.models import ResNet50_Weights
 
 from model.clstm import ConvLSTM
 from model.vae import LSTMVAE
@@ -155,11 +155,14 @@ class PTINet(nn.Module):
             )
 
         # ======================== Shared Decoder ========================
+        # ========== 解码器模块 ==========
+        # 位置嵌入层 - 将隐藏状态映射回位置空间
         self.pos_embedding = nn.Sequential(
             nn.Linear(in_features=args.hidden_size, out_features=self.size),
             nn.ReLU()
         )
-
+        
+        # LSTMCell解码器 - 用于序列生成
         self.speed_decoder = nn.LSTMCell(  # 速度轨迹解码器
             input_size=self.size,
             hidden_size=args.hidden_size
@@ -417,6 +420,13 @@ class PTINet(nn.Module):
             lcf_emb = self.lcf_proj(lcf_features)
             hpa = hpa + lcf_emb
             zpa = zpa + lcf_emb
+        elif lcf_features is not None and self.lcf_proj is None:
+            import warnings
+            warnings.warn(
+                "lcf_features provided but lcf_proj is None (lcf_feature_dim=0). "
+                "Features will be discarded. Set lcf_feature_dim > 0 to enable LCF projection.",
+                RuntimeWarning
+            )
 
         # ==================== Phase 3: GF Encoding ====================
         himg = torch.zeros(batch, hidden_size, device=device)
@@ -450,6 +460,13 @@ class PTINet(nn.Module):
             else:
                 intent_prior = intent_feature
             intent_emb = self.intent_proj(intent_prior)
+        elif intent_feature is not None and self.intent_proj is None:
+            import warnings
+            warnings.warn(
+                "intent_feature provided but intent_proj is None (intent_feature_dim=0). "
+                "Features will be discarded. Set intent_feature_dim > 0 to enable Intent projection.",
+                RuntimeWarning
+            )
 
         # ==================== Phase 5: Fusion & Loss ====================
         hds = hpo + hsp + hpa + hsa + pb + himg + himg_op + intent_emb
