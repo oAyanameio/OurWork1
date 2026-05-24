@@ -1,0 +1,44 @@
+use_argument_parser: False
+data_dir: '/home/lbh/PTINet/data/JAAD/'
+dataset: 'T2FPV'
+out_dir: '/home/lbh/OurWork1/output/'
+
+input: 5
+output: 5
+stride: 5
+skip: 1
+dtype: 'train'
+from_file: False
+save: True
+loader_workers: 8
+loader_shuffle: True
+pin_memory: True
+prefetch_factor: 3
+gpu: 0
+device: 'cuda'
+batch_size: 8
+n_epochs: 50
+lr: 0.001
+lr_scheduler: False
+hidden_size: 512
+hardtanh_limit: 100
+
+use_image: True
+image_network: 'clstm'
+
+use_opticalflow: False
+
+lcf_feature_dim: 0
+
+# VLM 意图特征维度；extract_intent.py 提取后设为 512
+intent_feature_dim: 0
+
+use_cofe: True
+cofe_hidden_size: 96
+cofe_num_layers: 2
+cofe_use_resnet: False
+cofe_loss_weight: 1.0
+cofe_frozen: False
+cofe_pretrained: ''
+cofe_dropout: 0.3
+cofe_layer_norm: False

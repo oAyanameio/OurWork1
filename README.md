@@ -45,14 +45,18 @@ CoFE 基于 GRU 编码器-解码器架构，支持 **FPV** 和 **BEV** 两种模
 绝对坐标 → 特征构建 → idxs选择 → GRU编码 → GRU解码 → 位移还原 → 修正后绝对坐标
 ```
 
-#### 2. VLM 语义意图特征（预留接口）
+#### 2. VLM 语义意图特征（离线提取）
 
-CoFE 可选集成 VLM（如 CLIP）离线提取的高级语义意图特征（512 维文本嵌入）：
+采用 **两阶段离线管线**（见 `scripts/extract_intent.py`）：
 
-- 作为"语义锚点"，在 FPV 轨迹噪声极高时稳定 GRU 隐藏状态
-- 通过 MLP 将 512 维意图特征映射到 GRU 隐藏空间
-- 在编码步骤中与位移特征、视觉特征拼接后送入 GRU 编码器
-- 在解码步骤中每个时间步参与 GRU 解码器隐藏状态更新
+1. **Qwen2.5-VL-7B**（vLLM）根据 FPV 图像生成结构化意图 JSON（直行、左转、避障等）
+2. **CLIP 文本编码器**（或 SentenceTransformer）将意图文本编码为 **512 维** `intent_feature`，写入预处理 `.pt`
+
+在模型中的作用：
+
+- 作为 CoFE 的 **「语义锚点」**，在 FPV 轨迹噪声极高时稳定 GRU 隐藏状态
+- 经 `CoFE.f_intent` 映射后，与位移特征、视觉特征拼接送入 GRU 编码器
+- 经 `PTINet.intent_proj` 投影后，参与解码器初始状态 `hds` / `zds` 融合
 
 #### 3. 物理一致性（速度重计算）
 
@@ -78,7 +82,7 @@ CoFE 模块实现了向量化计算，显著提升性能：
 | **行人属性** | 年龄、性别、群体大小 | MLP 编码器 |
 | **视觉图像** | 场景 RGB 图像序列 | ConvLSTM（CLSTM Image Module） |
 | **光流** | 相邻帧稠密光流 | ResNet50 + LSTM |
-| **VLM意图特征** | CLIP 文本嵌入（512 维） | MLP 投影（可选，用于 CoFE） |
+| **VLM意图特征** | Qwen2.5-VL 描述 → CLIP 文本嵌入（512 维） | `f_intent` + `intent_proj`（可选） |
 
 ### 输出
 
@@ -380,19 +384,75 @@ data/T2FPV/
 #### 运行预处理
 
 ```bash
-python data/preprocess_t2fpv.py --data_root ./FPVDataset
+python scripts/preprocess.py --data_root /path/to/FPVDataset --hist_len 5 --fut_len 12
 ```
+
+输出目录：`data/processed/t2fpv_{train,val,test}.pt`（已在 `.gitignore` 中忽略，需本地生成）
 
 预处理参数说明：
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--hist_len` | 历史帧数 | 8 |
+| `--hist_len` | 历史帧数（建议与 `config` 中 `input` 一致） | 8 |
 | `--fut_len` | 未来帧数 | 12 |
 | `--frame_skip` | 帧采样间隔 | 10 |
 | `--stride` | 滑动窗口步长 | 1 |
 | `--min_agents` | 每个场景最小行人数 | 2 |
 | `--folds` | 指定数据折（eth/hotel/univ/zara1/zara2） | 全部 |
+
+每个样本会写入 `scene_name`、`agent_ids`、`frame_ids_hist`，供后续 VLM 意图提取定位图像。
+
+---
+
+## VLM 意图特征离线提取
+
+### 1. 启动 Qwen2.5-VL 服务（vLLM）
+
+```bash
+python scripts/start_vllm.py
+# 默认: http://127.0.0.1:8000/v1  model: qwen2.5-vl-7b
+```
+
+验证服务：
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+### 2. 安装文本编码依赖（二选一）
+
+```bash
+pip install transformers
+# 或
+pip install sentence-transformers
+```
+
+### 3. 运行意图提取
+
+```bash
+# 正式提取（调用 VLM + 文本编码，结果写入 .pt）
+python scripts/extract_intent.py --split train val test \
+    --data_root /path/to/FPVDataset \
+    --resume
+
+# 调试管线（不调用 VLM）
+python scripts/extract_intent.py --split train --max_scenes 10 --dry_run
+```
+
+写入字段：
+
+| 字段 | 形状 | 说明 |
+|------|------|------|
+| `intent_feature` | `(N_agents, 512)` | 供 CoFE / PTINet 训练 |
+| `intent_text` | 字符串列表 | 便于人工检查 VLM 输出 |
+
+### 4. 启用训练
+
+在 `config/default.yml` 中设置：
+
+```yaml
+intent_feature_dim: 512
+```
 
 ---
 
@@ -400,7 +460,7 @@ python data/preprocess_t2fpv.py --data_root ./FPVDataset
 
 ### 配置文件
 
-模型配置通过 `config.yml` 管理：
+模型配置通过 `config/default.yml` 管理：
 
 ```yaml
 # 通用配置
@@ -416,8 +476,8 @@ image_network: 'clstm'
 use_opticalflow: False
 use_attribute: False
 
-# VLM 意图特征（预留接口）
-intent_feature_dim: 0  # 512 表示启用 CLIP 文本嵌入
+# VLM 意图特征（extract_intent.py 提取后设为 512）
+intent_feature_dim: 0
 
 # LCF 局部上下文特征（预留接口）
 lcf_feature_dim: 0     # >0 表示启用局部上下文特征
@@ -429,15 +489,31 @@ cofe_num_layers: 2
 cofe_loss_weight: 1.0  # CoFE 损失权重，控制 CoFE 参与训练的程度
 ```
 
-### 启动训练
+### CoFE 第一阶段预训练（可选）
 
-#### FPV 模式（T2FPV）
+仅训练 CoFE 去噪模块，权重供第二阶段加载：
 
 ```bash
-python train.py --dataset T2FPV
+python scripts/train_cofe_stage1.py
+# 输出: output/cofe_stage1/cofe_stage1.pkl
 ```
 
-模型检查点保存在 `checkpoints/` 文件夹中。
+### 启动端到端训练（T2FPV / FPV）
+
+分布式多卡训练（需 `torchrun`）：
+
+```bash
+torchrun --nproc_per_node=<GPU数> scripts/train.py
+```
+
+配置从 `config/default.yml` 读取；检查点默认保存在 `output/` 下。
+
+加载预训练 CoFE 时在配置中设置：
+
+```yaml
+cofe_pretrained: '/path/to/cofe_stage1.pkl'
+cofe_frozen: false   # true 表示冻结 CoFE 只训主网络
+```
 
 ---
 
@@ -450,7 +526,7 @@ python train.py --dataset T2FPV
 验证向量化优化的功能一致性和性能：
 
 ```bash
-python test_cofe_optimization.py
+python tests/test_cofe_optimization.py
 ```
 
 **测试内容**：
@@ -465,7 +541,7 @@ python test_cofe_optimization.py
 验证 CoFE 与 PTINet 的集成是否正常工作：
 
 ```bash
-python test_ptinet_integration.py
+python tests/test_ptinet_integration.py
 ```
 
 **测试内容**：
@@ -479,30 +555,40 @@ python test_ptinet_integration.py
 
 ```
 OurWork1/
-├── model/
-│   ├── network_image.py         # 主模型定义（PTINet + CoFE 集成）
-│   ├── cofe.py                 # CoFE 轨迹去噪修复模块（向量化优化）
-│   ├── vae.py                   # LSTMVAE 变分自编码器
-│   └── clstm.py                 # ConvLSTM 时空卷积模块
-├── datasets/
-│   ├── __init__.py              # 数据集注册入口
-│   └── t2fpv.py                 # T2FPV 数据集 PyTorch 注册
-├── data/
-│   ├── t2fpv_dataset.py         # T2FPV 数据集 PyTorch Dataset 类
-│   ├── preprocess_t2fpv.py     # T2FPV 预处理脚本
-│   └── processed/               # 预处理输出目录
-├── visualization/
-│   ├── visualize.py             # 可视化工具
-│   └── display.py               # 显示函数
-├── train.py                     # 分布式训练入口
-├── utils.py                     # 工具函数（ADE/FDE/速度转位置等）
-├── config.yml                   # 配置文件
-├── f1_score.py                  # F1 评分计算
-├── test_cofe_optimization.py    # CoFE 优化测试套件
-├── test_ptinet_integration.py   # PTINet 集成测试
-├── requirements.txt             # 依赖清单
-└── 参考文献/                     # 参考论文 PDF
+├── src/
+│   ├── models/
+│   │   ├── ptinet.py            # PTINet 主网络（CoFE 集成）
+│   │   ├── cofe.py                # CoFE 轨迹去噪（向量化优化）
+│   │   ├── vae.py                 # LSTMVAE
+│   │   └── clstm.py               # ConvLSTM
+│   ├── data/
+│   │   ├── t2fpv_dataset.py       # T2FPV Dataset
+│   │   ├── preprocess.py          # 预处理逻辑
+│   │   ├── intent_vlm.py          # Qwen2.5-VL / 图像路径解析
+│   │   └── intent_encoding.py     # 意图文本 → 512 维向量
+│   ├── training/
+│   │   ├── trainer.py             # 端到端分布式训练
+│   │   └── cofe_stage1.py         # CoFE 预训练
+│   ├── datasets/__init__.py       # 数据集注册
+│   └── utils/metrics.py           # ADE/FDE/speed2pos
+├── scripts/
+│   ├── train.py                   # 训练入口
+│   ├── train_cofe_stage1.py       # CoFE 预训练入口
+│   ├── preprocess.py              # 预处理入口
+│   ├── extract_intent.py          # VLM 意图特征离线提取
+│   ├── start_vllm.py              # 启动 Qwen2.5-VL vLLM 服务
+│   └── eval_cofe.py               # CoFE 独立评估
+├── tests/
+│   ├── test_cofe_optimization.py
+│   └── test_ptinet_integration.py
+├── config/default.yml             # 默认配置
+├── visualization/                 # 可视化工具
+├── references/                    # 参考文献与研究框架
+├── requirements.txt
+└── STRUCTURE_CHANGES.md           # 目录迁移说明
 ```
+
+本地数据目录（不纳入 Git）：`data/processed/`、`output/`
 
 ---
 
@@ -579,6 +665,16 @@ CoFE 模块的设计参考了 T2FPV 项目中的轨迹修正方法。
 ---
 
 ## 更新日志
+
+### 2026-05-24
+
+- ✅ 项目结构迁移至 `src/` + `scripts/` + `tests/` + `config/`
+- ✅ 实现 VLM 意图特征离线提取（`extract_intent.py`、`intent_vlm.py`、`intent_encoding.py`）
+- ✅ 新增 Qwen2.5-VL vLLM 启动脚本（`start_vllm.py`）
+- ✅ 新增 CoFE Stage1 预训练与独立评估脚本
+- ✅ T2FPV Dataset 支持 `intent_feature`，`hist_all` 与 `input` 时间维对齐
+- ✅ 预处理写入 `scene_name` / `agent_ids`，修复 `agent_id` 赋值错误
+- ✅ 研究框架文档迁移至 `references/研究思路与框架/`
 
 ### 2024-05-22
 

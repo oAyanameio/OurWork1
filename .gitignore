@@ -6,7 +6,11 @@ __pycache__/
 *.log
 output/
 runs/
-data/
+/data/
 *.pdf
 ptinet_env/
 .idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo

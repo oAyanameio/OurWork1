@@ -5,3 +5,8 @@ pandas>=1.3.0
 scikit-learn>=1.0.0
 pyyaml>=5.4.0
 tensorboard>=2.8.0
+
+# --- VLM 意图特征离线提取（scripts/extract_intent.py，二选一）---
+# transformers>=4.40.0
+# pillow>=9.0.0
+# sentence-transformers>=2.2.0
